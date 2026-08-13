@@ -13,7 +13,7 @@ import Testing
     #expect(SlackAppManifest.filename == "threadlight-slack-app-manifest.yaml")
     #expect(SlackAppManifest.createAppURL.absoluteString == "https://api.slack.com/apps")
     #expect(SlackAppManifest.template.hasPrefix("_metadata:\n  major_version: 1\n"))
-    #expect(SlackAppManifest.template.contains("threadlight://oauth/callback"))
+    #expect(SlackAppManifest.template.contains(SlackOAuth.redirectURI))
     #expect(SlackAppManifest.template.contains("pkce_enabled: true"))
     #expect(SlackAppManifest.template.contains("admin.legal_holds:read"))
     #expect(SlackAppManifest.template.contains("bot:\n      - team:read"))
@@ -45,18 +45,19 @@ import Testing
 
 @Test func callbackRequiresMatchingStateAndRoute() throws {
     let attempt = try OAuthAttempt.make(clientID: "123.456")
-    #expect(attempt.authorizationURL.path == "/oauth/v2_user/authorize")
+    #expect(attempt.authorizationURL.path == "/oauth/v2/authorize")
     let authorizationItems = URLComponents(url: attempt.authorizationURL, resolvingAgainstBaseURL: false)?.queryItems ?? []
-    #expect(authorizationItems.first(where: { $0.name == "scope" })?.value == "admin.legal_holds:read")
-    #expect(authorizationItems.first(where: { $0.name == "user_scope" }) == nil)
+    #expect(authorizationItems.first(where: { $0.name == "user_scope" })?.value == "admin.legal_holds:read")
+    #expect(authorizationItems.first(where: { $0.name == "scope" })?.value == "team:read")
+    #expect(authorizationItems.first(where: { $0.name == "redirect_uri" })?.value == SlackOAuth.redirectURI)
     #expect(authorizationItems.first(where: { $0.name == "code_challenge_method" })?.value == "S256")
-    let good = URL(string: "threadlight://oauth/callback?code=abc&state=\(attempt.state)")!
+    let good = URL(string: "https://callback.threadlight.invalid/oauth/callback?code=abc&state=\(attempt.state)")!
     #expect(try attempt.authorizationCode(from: good) == "abc")
-    let bad = URL(string: "threadlight://oauth/callback?code=abc&state=wrong")!
+    let bad = URL(string: "https://callback.threadlight.invalid/oauth/callback?code=abc&state=wrong")!
     #expect(throws: (any Error).self) { _ = try attempt.authorizationCode(from: bad) }
-    let duplicate = URL(string: "threadlight://oauth/callback?code=abc&code=def&state=\(attempt.state)")!
+    let duplicate = URL(string: "https://callback.threadlight.invalid/oauth/callback?code=abc&code=def&state=\(attempt.state)")!
     #expect(throws: (any Error).self) { _ = try attempt.authorizationCode(from: duplicate) }
-    let denied = URL(string: "threadlight://oauth/callback?error=access_denied&state=\(attempt.state)")!
+    let denied = URL(string: "https://callback.threadlight.invalid/oauth/callback?error=access_denied&state=\(attempt.state)")!
     do {
         _ = try attempt.authorizationCode(from: denied)
         Issue.record("Expected Slack denial")
@@ -234,7 +235,7 @@ import Testing
         organizationName: "Example",
         enterpriseDomain: "example.enterprise.slack.com",
         clientID: "123.456",
-        redirectURI: "threadlight://oauth/callback",
+        redirectURI: SlackOAuth.redirectURI,
         requiredScope: "admin.legal_holds:read",
         completedRequirements: [.internalApp],
         administratorCompletedAt: .now,

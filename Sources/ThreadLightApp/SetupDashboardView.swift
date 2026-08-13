@@ -6,6 +6,7 @@ struct SlackAppInstallationSettingsView: View {
     @Environment(AppModel.self) private var model
     @State private var copiedManifest = false
     @State private var isConnecting = false
+    @State private var pastedCallback = ""
 
     var body: some View {
         @Bindable var setup = model.setup
@@ -86,17 +87,46 @@ struct SlackAppInstallationSettingsView: View {
                         HStack {
                             Link("Open Slack apps", destination: SlackAppManifest.createAppURL)
                             Button {
-                                isConnecting = true
-                                Task {
-                                    await model.connectSlack()
-                                    isConnecting = false
-                                }
+                                model.beginSlackSignIn()
                             } label: {
                                 Label(connectionButtonTitle, systemImage: model.isConnected ? "checkmark.circle.fill" : "person.crop.circle.badge.checkmark")
                             }
                             .buttonStyle(.borderedProminent)
                             .tint(ThreadLightTheme.violet)
-                            .disabled(!hasAppDetails || isConnecting || model.isConnected)
+                            .disabled(!hasAppDetails || isConnecting || model.isConnected || model.pendingSignIn != nil)
+                        }
+
+                        if model.pendingSignIn != nil, !model.isConnected {
+                            VStack(alignment: .leading, spacing: 8) {
+                                Text("Finish signing in")
+                                    .font(.headline)
+                                Text("After you approve ThreadLight, the browser lands on a page that cannot be reached — that is expected and safe. Copy the entire address from the browser's address bar and paste it here.")
+                                    .foregroundStyle(.secondary)
+                                TextField("https://callback.threadlight.invalid/oauth/callback?code=…", text: $pastedCallback)
+                                    .textFieldStyle(.roundedBorder)
+                                    .font(.system(.body, design: .monospaced))
+                                HStack {
+                                    Button("Complete Sign-In") {
+                                        isConnecting = true
+                                        Task {
+                                            await model.completeSlackSignIn(pastedCallback: pastedCallback)
+                                            if model.pendingSignIn == nil { pastedCallback = "" }
+                                            isConnecting = false
+                                        }
+                                    }
+                                    .buttonStyle(.borderedProminent)
+                                    .tint(ThreadLightTheme.violet)
+                                    .disabled(pastedCallback.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || isConnecting)
+                                    Button("Cancel") {
+                                        model.cancelSlackSignIn()
+                                        pastedCallback = ""
+                                    }
+                                    .disabled(isConnecting)
+                                }
+                            }
+                            .padding(12)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .background(ThreadLightTheme.violet.opacity(0.08), in: RoundedRectangle(cornerRadius: 10))
                         }
 
                         if model.isConnected {
@@ -152,6 +182,7 @@ struct SlackAppInstallationSettingsView: View {
     private var connectionButtonTitle: String {
         if isConnecting { return "Signing in…" }
         if model.isConnected { return "Slack verified" }
+        if model.pendingSignIn != nil { return "Waiting for sign-in…" }
         return "Sign in and verify"
     }
 

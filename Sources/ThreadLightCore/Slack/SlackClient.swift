@@ -68,7 +68,7 @@ public actor SlackOAuthClient {
         code: String,
         verifier: String,
         clientID: String,
-        redirectURI: String = "threadlight://oauth/callback"
+        redirectURI: String = SlackOAuth.redirectURI
     ) async throws -> OAuthTokenSet {
         try await tokenRequest([
             "code": code,
@@ -87,7 +87,7 @@ public actor SlackOAuthClient {
     }
 
     private func tokenRequest(_ fields: [String: String]) async throws -> OAuthTokenSet {
-        var request = URLRequest(url: URL(string: "https://slack.com/api/oauth.v2.user.access")!)
+        var request = URLRequest(url: URL(string: "https://slack.com/api/oauth.v2.access")!)
         request.httpMethod = "POST"
         request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
         request.httpBody = FormEncoding.encode(fields)
@@ -350,9 +350,9 @@ public enum SlackErrorMapper {
     public static func error(for code: String) -> ThreadLightError {
         switch code {
         case "oauth_authorization_url_mismatch", "cannot_install_an_org_installed_app":
-            .slack("Slack received an installation OAuth request for an already installed app.", remediation: "Update ThreadLight and reconnect. User authorization must use Slack's v2_user flow, not the app installation endpoint.")
+            .slack("Slack rejected the authorization request shape.", remediation: "Update ThreadLight and sign in again from Settings.")
         case "no_bot_scopes_requested":
-            .slack("Slack did not request the bot scope required for organization installation.", remediation: "Open this app in Slack app settings, choose Settings → Install App → Install to Organization, and select the Enterprise organization. Do not start installation from ThreadLight's OAuth button.")
+            .slack("The Slack app is missing the bot scope required for authorization.", remediation: "Restore the app manifest's bot_user section and bot scope team:read, save it in Slack app settings, then sign in again.")
         case "missing_scope", "unknown_method":
             .slack("Legal Holds read access is missing.", remediation: "Keep only admin.legal_holds:read under user scopes, retain bot scope team:read for organization installation, then reconnect from ThreadLight.")
         case "legal_hold_not_found":
@@ -370,9 +370,9 @@ public enum SlackErrorMapper {
         case "access_denied", "user_scope_not_granted":
             .slack("Slack sign-in was not approved.", remediation: "Try again and allow ThreadLight to read legal holds.")
         case "bad_redirect_uri":
-            .slack("The OAuth callback does not match.", remediation: "Set the Slack app redirect URL to threadlight://oauth/callback. ThreadLight supplies PKCE automatically.")
+            .slack("The OAuth callback does not match.", remediation: "Set the Slack app redirect URL to \(SlackOAuth.redirectURI). ThreadLight supplies PKCE automatically.")
         case "pkce_not_allowed":
-            .slack("PKCE is not enabled for this Slack app.", remediation: "Open OAuth & Permissions for the organization-owned app, enable PKCE, confirm threadlight://oauth/callback, and try again.")
+            .slack("PKCE is not enabled for this Slack app.", remediation: "Open OAuth & Permissions for the organization-owned app, enable PKCE, confirm \(SlackOAuth.redirectURI), and try again.")
         case "invalid_code_verifier":
             .slack("Slack rejected the secure sign-in proof.", remediation: "Start a new sign-in from ThreadLight. If it repeats, confirm PKCE is enabled for the Slack app.")
         case "ratelimited":

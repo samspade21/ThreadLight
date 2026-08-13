@@ -17,7 +17,7 @@ public enum SlackAppManifest {
         always_online: false
     oauth_config:
       redirect_urls:
-        - threadlight://oauth/callback
+        - https://callback.threadlight.invalid/oauth/callback
       scopes:
         bot:
           - team:read

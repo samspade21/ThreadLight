@@ -62,7 +62,7 @@ public enum SetupTransferVerifier {
         let package = try CanonicalJSON.decoder.decode(SetupHandoffPackage.self, from: data)
         guard data == (try CanonicalJSON.encode(package)),
               package.schemaVersion == 2,
-              package.redirectURI == "threadlight://oauth/callback",
+              package.redirectURI == SlackOAuth.redirectURI,
               package.requiredScope == "admin.legal_holds:read" else {
             throw ThreadLightError.invalidConfiguration("The Legal request format is unsupported or noncanonical.")
         }
@@ -87,7 +87,7 @@ public enum SetupTransferVerifier {
         let package = try CanonicalJSON.decoder.decode(SetupCompletionPackage.self, from: data)
         guard data == (try CanonicalJSON.encode(package)),
               package.schemaVersion == 2,
-              package.redirectURI == "threadlight://oauth/callback",
+              package.redirectURI == SlackOAuth.redirectURI,
               package.requiredScope == "admin.legal_holds:read",
               package.legalOAuthRequired,
               package.tokenTransferProhibited,

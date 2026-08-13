@@ -1,5 +1,4 @@
 import AppKit
-import AuthenticationServices
 import Foundation
 import Observation
 import ThreadLightCore
@@ -61,11 +60,11 @@ final class AppModel {
     var lastImportReport: ImportReport?
     var importProgress: ImportProgress?
     private(set) var currentOrganizationID: String?
+    private(set) var pendingSignIn: OAuthAttempt?
 
     private var store: EvidenceStore?
     private var resourceVault: ResourceVault?
     private var legalHoldClient: (any LegalHoldClient)?
-    private let authorization = SlackAuthorizationController()
     private let tokenVault = SlackTokenVault()
     private let quickLook = QuickLookPresenter()
     private var holdLoadTask: Task<Void, Never>?
@@ -150,51 +149,78 @@ final class AppModel {
         }
     }
 
-    func connectSlack() async {
+    func beginSlackSignIn() {
         do {
             setup.save()
-            let tokens = try await authorization.authorize(clientID: setup.slackClientID)
-            guard tokens.hasExactLegalHoldsReadScope else {
-                throw ThreadLightError.authentication("Slack did not grant exactly admin.legal_holds:read. Remove every other user scope and reconnect from ThreadLight. Keep the installation bot scope team:read.")
+            let attempt = try OAuthAttempt.make(clientID: setup.slackClientID)
+            pendingSignIn = attempt
+            NSWorkspace.shared.open(attempt.authorizationURL)
+            statusMessage = "Approve ThreadLight in the browser, then paste the address of the final page below."
+        } catch {
+            show(error)
+        }
+    }
+
+    func cancelSlackSignIn() {
+        pendingSignIn = nil
+        statusMessage = "Slack sign-in canceled."
+    }
+
+    func completeSlackSignIn(pastedCallback: String) async {
+        guard let attempt = pendingSignIn else { return }
+        do {
+            let trimmed = pastedCallback.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard let callbackURL = URL(string: trimmed), callbackURL.host != nil else {
+                throw ThreadLightError.authentication("That text is not a web address. Copy the entire address from the browser's address bar.")
             }
-            let validationClient = SlackLegalHoldClient(accessToken: tokens.accessToken)
-            let loadedHolds = try await validationClient.listPolicies(status: nil)
-            let organizationID = try verifiedOrganizationID(tokens: tokens, holds: loadedHolds)
-            try setup.recordValidatedOrganizationID(organizationID)
-            try await openStorage(organizationID: organizationID)
-            try await tokenVault.save(tokens, organizationID: "current")
-            let client = RefreshingLegalHoldClient(
-                tokens: tokens,
-                clientID: setup.slackClientID,
-                tokenVault: tokenVault
-            )
-            legalHoldClient = client
-            isConnected = true
-            let currentHoldIDs = Set(loadedHolds.map(\.id))
-            for oldHold in try await store?.holds() ?? [] where !currentHoldIDs.contains(oldHold.id) {
-                _ = try await store?.purgeEvidence(holdID: oldHold.id)
-            }
-            holds = loadedHolds
-            for hold in loadedHolds {
-                try await store?.save(hold: hold)
-                if hold.status == .active {
-                    let currentCustodians = try await client.listCustodians(policyID: hold.id)
-                    _ = try await reconcileCustodians(currentCustodians, for: hold)
-                }
-            }
-            setup.update(.internalApp, state: .ready)
-            setup.update(.pkce, state: .ready)
-            setup.update(.readScope, state: .ready)
-            setup.update(.enterpriseInstall, state: .ready, message: "Slack returned \(loadedHolds.count) legal hold policies.")
-            statusMessage = "Signed in to Slack. Choose a legal hold or import its encrypted package."
-            touchActivity()
-            if let first = loadedHolds.first { sidebarSelection = .hold(first.id) }
+            let code = try attempt.authorizationCode(from: callbackURL)
+            let tokens = try await SlackOAuthClient().exchange(code: code, verifier: attempt.pkce.verifier, clientID: setup.slackClientID)
+            pendingSignIn = nil
+            try await finishSlackConnection(tokens: tokens)
         } catch {
             if case let ThreadLightError.slack(_, remediation) = error {
                 setup.update(.enterpriseInstall, state: .blocked(reason: remediation))
             }
             show(error)
         }
+    }
+
+    private func finishSlackConnection(tokens: OAuthTokenSet) async throws {
+        guard tokens.hasExactLegalHoldsReadScope else {
+            throw ThreadLightError.authentication("Slack did not grant exactly admin.legal_holds:read. Remove every other user scope and reconnect from ThreadLight. Keep the installation bot scope team:read.")
+        }
+        let validationClient = SlackLegalHoldClient(accessToken: tokens.accessToken)
+        let loadedHolds = try await validationClient.listPolicies(status: nil)
+        let organizationID = try verifiedOrganizationID(tokens: tokens, holds: loadedHolds)
+        try setup.recordValidatedOrganizationID(organizationID)
+        try await openStorage(organizationID: organizationID)
+        try await tokenVault.save(tokens, organizationID: "current")
+        let client = RefreshingLegalHoldClient(
+            tokens: tokens,
+            clientID: setup.slackClientID,
+            tokenVault: tokenVault
+        )
+        legalHoldClient = client
+        isConnected = true
+        let currentHoldIDs = Set(loadedHolds.map(\.id))
+        for oldHold in try await store?.holds() ?? [] where !currentHoldIDs.contains(oldHold.id) {
+            _ = try await store?.purgeEvidence(holdID: oldHold.id)
+        }
+        holds = loadedHolds
+        for hold in loadedHolds {
+            try await store?.save(hold: hold)
+            if hold.status == .active {
+                let currentCustodians = try await client.listCustodians(policyID: hold.id)
+                _ = try await reconcileCustodians(currentCustodians, for: hold)
+            }
+        }
+        setup.update(.internalApp, state: .ready)
+        setup.update(.pkce, state: .ready)
+        setup.update(.readScope, state: .ready)
+        setup.update(.enterpriseInstall, state: .ready, message: "Slack returned \(loadedHolds.count) legal hold policies.")
+        statusMessage = "Signed in to Slack. Choose a legal hold or import its encrypted package."
+        touchActivity()
+        if let first = loadedHolds.first { sidebarSelection = .hold(first.id) }
     }
 
     func selectHold(id: String) {
@@ -989,35 +1015,3 @@ private actor DemoLegalHoldClient: LegalHoldClient {
     }
 }
 #endif
-
-@MainActor
-private final class SlackAuthorizationController: NSObject, ASWebAuthenticationPresentationContextProviding {
-    private var session: ASWebAuthenticationSession?
-
-    func authorize(clientID: String) async throws -> OAuthTokenSet {
-        let attempt = try OAuthAttempt.make(clientID: clientID)
-        defer {
-            session?.cancel()
-            session = nil
-        }
-        let callbackURL: URL = try await withCheckedThrowingContinuation { continuation in
-            let session = ASWebAuthenticationSession(url: attempt.authorizationURL, callbackURLScheme: "threadlight") { url, error in
-                if let error { continuation.resume(throwing: error) }
-                else if let url { continuation.resume(returning: url) }
-                else { continuation.resume(throwing: ThreadLightError.authentication("Slack sign-in ended without a callback.")) }
-            }
-            session.presentationContextProvider = self
-            self.session = session
-            guard session.start() else {
-                continuation.resume(throwing: ThreadLightError.authentication("Could not open the secure Slack sign-in window."))
-                return
-            }
-        }
-        let code = try attempt.authorizationCode(from: callbackURL)
-        return try await SlackOAuthClient().exchange(code: code, verifier: attempt.pkce.verifier, clientID: clientID)
-    }
-
-    func presentationAnchor(for session: ASWebAuthenticationSession) -> ASPresentationAnchor {
-        NSApplication.shared.keyWindow ?? NSApplication.shared.windows.first ?? ASPresentationAnchor()
-    }
-}

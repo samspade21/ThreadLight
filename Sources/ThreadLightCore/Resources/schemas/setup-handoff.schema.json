@@ -15,7 +15,7 @@
     "requestedActions": { "type": "array", "items": { "type": "string" } },
     "clientID": { "type": ["string", "null"] },
     "clientIDInstruction": { "type": "string" },
-    "redirectURI": { "const": "threadlight://oauth/callback" },
+    "redirectURI": { "const": "https://callback.threadlight.invalid/oauth/callback" },
     "requiredScope": { "const": "admin.legal_holds:read" },
     "holdID": { "type": ["string", "null"] },
     "holdName": { "type": ["string", "null"] },

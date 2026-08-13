@@ -50,7 +50,7 @@ public struct ManagedConfiguration: Equatable, Sendable {
               defaults.objectIsForced(forKey: Key.organizationName),
               defaults.objectIsForced(forKey: Key.enterpriseDomain),
               defaults.objectIsForced(forKey: Key.expectedOrganizationID),
-              defaults.string(forKey: Key.redirectURI) == "threadlight://oauth/callback",
+              defaults.string(forKey: Key.redirectURI) == SlackOAuth.redirectURI,
               defaults.string(forKey: Key.requiredScope) == "admin.legal_holds:read",
               defaults.integer(forKey: Key.version) == 1 else { return nil }
         return try? .init(
@@ -69,7 +69,7 @@ public struct ManagedConfiguration: Equatable, Sendable {
             Key.organizationName: organizationName,
             Key.enterpriseDomain: enterpriseDomain,
             Key.expectedOrganizationID: expectedOrganizationID,
-            Key.redirectURI: "threadlight://oauth/callback",
+            Key.redirectURI: SlackOAuth.redirectURI,
             Key.requiredScope: "admin.legal_holds:read",
             Key.retentionDays: retentionDays,
         ]

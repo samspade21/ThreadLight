@@ -19,7 +19,7 @@ You need:
 4. Choose **Create New App → From an app manifest**.
 5. Choose a workspace in the target organization, select **YAML**, paste the manifest, and create the app.
 
-Use the manifest unchanged. It contains organization deployment, PKCE, `threadlight://oauth/callback`, bot scope `team:read`, and user scope `admin.legal_holds:read`. ThreadLight never needs the Client Secret.
+Use the manifest unchanged. It contains organization deployment, PKCE, `https://callback.threadlight.invalid/oauth/callback`, bot scope `team:read`, and user scope `admin.legal_holds:read`. ThreadLight never needs the Client Secret.
 
 ## 2. Enter the app details
 
@@ -34,7 +34,7 @@ In Slack, open **Basic Information → App Credentials**. Copy the public Client
 5. When ThreadLight confirms that Slack returned the legal hold list, choose **Save MDM profile…**.
 6. Add the `.mobileconfig` to MDM and assign it to the managed Macs that will use ThreadLight.
 
-The installation entry point matters. If Slack returns `no_bot_scopes_requested`, return to the specific app's **Settings → Install App** page. ThreadLight's later sign-in uses Slack's user authorization flow and does not reinstall the app.
+If Slack returns `no_bot_scopes_requested`, the app manifest lost its `bot_user` section or the `team:read` bot scope — restore the manifest and sign in again. During sign-in the browser finishes on a page that cannot be reached (`callback.threadlight.invalid`); this is expected. Copy the entire address from the browser's address bar and paste it into ThreadLight to complete the sign-in.
 
 ## Prepare an encrypted package
 

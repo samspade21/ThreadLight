@@ -6,7 +6,7 @@ import Testing
 struct SlackClientTests {
     @Test func oauthExchangeUsesPKCEWithoutClientSecretAndParsesRotatingTokens() async throws {
         let session = MockURLProtocol.session { request in
-            #expect(request.url?.path == "/api/oauth.v2.user.access")
+            #expect(request.url?.path == "/api/oauth.v2.access")
             let body = String(data: try Self.bodyData(for: request), encoding: .utf8) ?? ""
             #expect(body.contains("code_verifier=verifier"))
             #expect(!body.contains("client_secret"))
@@ -136,13 +136,13 @@ struct SlackClientTests {
             return
         }
         #expect(message.contains("bot scope"))
-        #expect(remediation.contains("Settings → Install App"))
-        #expect(remediation.contains("Install to Organization"))
+        #expect(remediation.contains("bot_user"))
+        #expect(remediation.contains("team:read"))
     }
 
     @Test func longRunningClientRotatesExpiredTokenBeforeLegalHoldRequest() async throws {
         let session = MockURLProtocol.session { request in
-            if request.url?.path == "/api/oauth.v2.user.access" {
+            if request.url?.path == "/api/oauth.v2.access" {
                 let body = String(data: try Self.bodyData(for: request), encoding: .utf8) ?? ""
                 #expect(body.contains("grant_type=refresh_token"))
                 #expect(body.contains("refresh_token=refresh-old"))

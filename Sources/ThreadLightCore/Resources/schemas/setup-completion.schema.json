@@ -12,7 +12,7 @@
     "organizationName": { "type": "string", "minLength": 1 },
     "enterpriseDomain": { "type": "string", "minLength": 1 },
     "clientID": { "type": "string", "minLength": 1 },
-    "redirectURI": { "const": "threadlight://oauth/callback" },
+    "redirectURI": { "const": "https://callback.threadlight.invalid/oauth/callback" },
     "requiredScope": { "const": "admin.legal_holds:read" },
     "completedRequirements": {
       "type": "array",

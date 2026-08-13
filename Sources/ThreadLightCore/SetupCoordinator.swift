@@ -146,7 +146,7 @@ public final class SetupCoordinator {
 
         ## Internal app
         1. Create an organization-owned internal app from the single included `docs/slack-app-manifest.yaml`.
-        2. Confirm bot scope `team:read`, user scope `admin.legal_holds:read`, PKCE, `threadlight://oauth/callback`, and organization deployment.
+        2. Confirm bot scope `team:read`, user scope `admin.legal_holds:read`, PKCE, `https://callback.threadlight.invalid/oauth/callback`, and organization deployment.
         3. In that app's settings, open Install App and choose Install to Organization as an Org Owner. Select the Enterprise organization, not a workspace.
         4. Enter the public client ID in ThreadLight, then choose Connect IT Role to Slack. ThreadLight requests only the user scope and verifies it by listing Legal Hold policies.
         5. Create the signed Slack Admin handoff and return the entire response folder to the Legal Role.
@@ -190,7 +190,7 @@ public final class SetupCoordinator {
             ],
             clientID: slackClientID.isEmpty ? nil : slackClientID,
             clientIDInstruction: "Return only the Slack app client ID to Legal. Never send a client secret or OAuth token.",
-            redirectURI: "threadlight://oauth/callback",
+            redirectURI: SlackOAuth.redirectURI,
             requiredScope: "admin.legal_holds:read",
             holdID: hold?.id,
             holdName: hold?.name,
@@ -213,7 +213,7 @@ public final class SetupCoordinator {
 
     public func importAdministratorRequest(_ package: SetupHandoffPackage, signerKeyID: String? = nil) throws {
         guard package.schemaVersion == 2,
-              package.redirectURI == "threadlight://oauth/callback",
+              package.redirectURI == SlackOAuth.redirectURI,
               package.requiredScope == "admin.legal_holds:read",
               package.appManifestSHA256 == SHA256Digest.data(Data(SlackAppManifest.template.utf8)) else {
             throw ThreadLightError.invalidConfiguration("This is not a supported ThreadLight Slack Admin setup request.")
@@ -261,7 +261,7 @@ public final class SetupCoordinator {
             organizationName: organizationName,
             enterpriseDomain: organizationDomain,
             clientID: slackClientID,
-            redirectURI: "threadlight://oauth/callback",
+            redirectURI: SlackOAuth.redirectURI,
             requiredScope: "admin.legal_holds:read",
             completedRequirements: SetupRequirementID.administratorRequirements,
             administratorCompletedAt: completedAt,
@@ -273,7 +273,7 @@ public final class SetupCoordinator {
 
     public func importAdministratorCompletion(_ package: SetupCompletionPackage, signerKeyID: String) throws {
         guard package.schemaVersion == 2,
-              package.redirectURI == "threadlight://oauth/callback",
+              package.redirectURI == SlackOAuth.redirectURI,
               package.requiredScope == "admin.legal_holds:read",
               package.legalOAuthRequired,
               package.tokenTransferProhibited,
@@ -377,7 +377,7 @@ public final class SetupCoordinator {
         ),
         .init(
             id: .pkce,
-            detail: "Add threadlight://oauth/callback and enable PKCE. Slack treats PKCE as a one-way app setting.",
+            detail: "Add https://callback.threadlight.invalid/oauth/callback and enable PKCE. Slack treats PKCE as a one-way app setting.",
             why: "PKCE lets a desktop app authenticate without embedding a client secret. Slack rejects custom app callbacks that do not use it.",
             owner: .slackAdministrator,
             actionURL: URL(string: "https://api.slack.com/apps")

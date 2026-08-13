@@ -14,7 +14,7 @@ Slack OAuth tokens, imported message content, attachments, hold/custodian metada
 ## Primary threats and controls
 
 - **Over-broad Slack access:** customer-owned app, organization install, exact single documented read scope enforced on returned and rotated tokens, no write methods.
-- **OAuth interception:** ASWebAuthenticationSession, PKCE S256, high-entropy state, custom callback validation, rotating tokens.
+- **OAuth interception:** PKCE S256 with the verifier never leaving the Mac, high-entropy state, and an RFC 2606 `.invalid` callback host that can never resolve or be registered — the authorization code only ever appears in the user's own browser address bar, where they paste it back into ThreadLight. An intercepted code is useless without the local verifier.
 - **Token theft:** ThisDeviceOnly Keychain items; tokens never logged or stored in preferences/database.
 - **Archive attacks:** reject absolute paths, traversal, symlinks, excessive file count, excessive expanded size, malformed JSON, and unsupported layouts.
 - **Evidence leakage:** SQLCipher database; AES-GCM resource vault; owner-only decrypted Quick Look files removed when preview closes and stale previews removed at next launch; no evidence-content application logging; no telemetry.
