@@ -1,0 +1,78 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://threadlight.dev/schemas/normalized-evidence-v1.json",
+  "title": "ThreadLight Normalized Evidence",
+  "type": "object",
+  "required": ["schemaVersion", "hold", "messages"],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "hold": { "$ref": "#/$defs/hold" },
+    "messages": { "type": "array", "maxItems": 50000, "items": { "$ref": "#/$defs/message" } }
+  },
+  "$defs": {
+    "hold": {
+      "type": "object",
+      "required": ["id", "organizationID", "name", "summary", "status", "restrictions", "createdAt", "updatedAt"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "organizationID": { "type": "string", "minLength": 1 },
+        "name": { "type": "string" },
+        "summary": { "type": "string" },
+        "status": { "enum": ["ACTIVE", "RELEASED", "UNKNOWN"] },
+        "restrictions": { "type": "array", "uniqueItems": true, "items": { "enum": ["NO_RESTRICTION", "ONLY_DMS"] } },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" },
+        "startAt": { "type": "string", "format": "date-time" },
+        "endAt": { "type": "string", "format": "date-time" }
+      },
+      "additionalProperties": false
+    },
+    "message": {
+      "type": "object",
+      "required": ["id", "conversationID", "conversationName", "conversationKind", "threadID", "senderID", "senderName", "text", "postedAt", "isDeleted", "files", "rawJSON"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "conversationID": { "type": "string", "minLength": 1 },
+        "conversationName": { "type": "string" },
+        "conversationKind": { "enum": ["publicChannel", "privateChannel", "directMessage", "groupDirectMessage", "unknown"] },
+        "threadID": { "type": "string", "minLength": 1 },
+        "senderID": { "type": "string", "minLength": 1 },
+        "senderName": { "type": "string" },
+        "text": { "type": "string" },
+        "postedAt": { "type": "string", "format": "date-time" },
+        "editedAt": { "type": "string", "format": "date-time" },
+        "isDeleted": { "type": "boolean" },
+        "reactions": { "type": "array", "items": { "$ref": "#/$defs/reaction" } },
+        "files": { "type": "array", "items": { "$ref": "#/$defs/evidenceFile" } },
+        "rawJSON": { "type": "string", "contentEncoding": "base64" }
+      },
+      "additionalProperties": false
+    },
+    "reaction": {
+      "type": "object",
+      "required": ["name", "count", "userIDs"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "count": { "type": "integer", "minimum": 0 },
+        "userIDs": { "type": "array", "items": { "type": "string" } }
+      },
+      "additionalProperties": false
+    },
+    "evidenceFile": {
+      "type": "object",
+      "required": ["id", "name"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "name": { "type": "string" },
+        "mimeType": { "type": "string" },
+        "size": { "type": "integer", "minimum": 0 },
+        "remoteURL": { "type": "string", "format": "uri" },
+        "localRelativePath": { "type": "string" },
+        "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+        "extractedText": { "type": "string" }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

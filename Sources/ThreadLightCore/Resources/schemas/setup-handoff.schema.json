@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://threadlight.dev/schemas/setup-handoff-v2.json",
+  "title": "ThreadLight Administrator Handoff",
+  "type": "object",
+  "required": ["schemaVersion", "requestID", "appManifestSHA256", "createdAt", "organizationName", "enterpriseDomain", "requestedRole", "requestedActions", "clientIDInstruction", "redirectURI", "requiredScope", "custodians", "checklist"],
+  "properties": {
+    "schemaVersion": { "const": 2 },
+    "requestID": { "type": "string", "format": "uuid" },
+    "appManifestSHA256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "createdAt": { "type": "string", "format": "date-time" },
+    "organizationName": { "type": "string" },
+    "enterpriseDomain": { "type": "string" },
+    "requestedRole": { "type": "string" },
+    "requestedActions": { "type": "array", "items": { "type": "string" } },
+    "clientID": { "type": ["string", "null"] },
+    "clientIDInstruction": { "type": "string" },
+    "redirectURI": { "const": "threadlight://oauth/callback" },
+    "requiredScope": { "const": "admin.legal_holds:read" },
+    "holdID": { "type": ["string", "null"] },
+    "holdName": { "type": ["string", "null"] },
+    "exportStart": { "type": ["string", "null"], "format": "date-time" },
+    "exportEnd": { "type": ["string", "null"], "format": "date-time" },
+    "custodians": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "displayName"],
+        "properties": { "id": { "type": "string" }, "displayName": { "type": "string" } },
+        "additionalProperties": false
+      }
+    },
+    "checklist": { "type": "array", "items": { "type": "string" } }
+  },
+  "additionalProperties": false
+}

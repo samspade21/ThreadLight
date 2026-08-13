@@ -1,0 +1,75 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://threadlight.dev/schemas/evidence-manifest-v1.json",
+  "title": "ThreadLight Evidence Manifest",
+  "type": "object",
+  "required": ["schemaVersion", "exportID", "createdAt", "application", "hold", "items", "sources", "files", "warnings"],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "exportID": { "type": "string", "format": "uuid" },
+    "createdAt": { "type": "string", "format": "date-time" },
+    "application": { "type": "string", "minLength": 1 },
+    "hold": { "$ref": "#/$defs/hold" },
+    "items": { "type": "array", "maxItems": 100000, "items": { "$ref": "#/$defs/item" } },
+    "sources": { "type": "array", "maxItems": 1000, "items": { "$ref": "#/$defs/source" } },
+    "files": { "type": "array", "maxItems": 100000, "items": { "$ref": "#/$defs/file" } },
+    "warnings": { "type": "array", "items": { "type": "string" } }
+  },
+  "$defs": {
+    "hold": {
+      "type": "object",
+      "required": ["id", "name", "status", "restrictions"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "name": { "type": "string" },
+        "status": { "enum": ["ACTIVE", "RELEASED", "UNKNOWN"] },
+        "startAt": { "type": "string", "format": "date-time" },
+        "endAt": { "type": "string", "format": "date-time" },
+        "restrictions": { "type": "array", "uniqueItems": true, "items": { "enum": ["NO_RESTRICTION", "ONLY_DMS"] } }
+      },
+      "additionalProperties": false
+    },
+    "item": {
+      "type": "object",
+      "required": ["messageID", "conversationID", "threadID", "postedAt", "sha256", "sourceArchiveID", "custodianID"],
+      "properties": {
+        "messageID": { "type": "string", "minLength": 1 },
+        "conversationID": { "type": "string", "minLength": 1 },
+        "threadID": { "type": "string", "minLength": 1 },
+        "postedAt": { "type": "string", "format": "date-time" },
+        "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+        "sourceArchiveID": { "type": "string", "format": "uuid" },
+        "custodianID": { "type": "string", "minLength": 1 }
+      },
+      "additionalProperties": false
+    },
+    "source": {
+      "type": "object",
+      "required": ["id", "holdID", "custodianID", "originalFilename", "sha256", "importedAt", "operatorBinding", "isPerCustodian"],
+      "properties": {
+        "id": { "type": "string", "format": "uuid" },
+        "holdID": { "type": "string", "minLength": 1 },
+        "custodianID": { "type": "string", "minLength": 1 },
+        "originalFilename": { "type": "string", "minLength": 1 },
+        "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+        "importedAt": { "type": "string", "format": "date-time" },
+        "coverageStart": { "type": "string", "format": "date-time" },
+        "coverageEnd": { "type": "string", "format": "date-time" },
+        "operatorBinding": { "type": "string", "minLength": 1 },
+        "isPerCustodian": { "const": true }
+      },
+      "additionalProperties": false
+    },
+    "file": {
+      "type": "object",
+      "required": ["path", "sha256", "byteCount"],
+      "properties": {
+        "path": { "type": "string", "pattern": "^(README\\.txt|evidence\\.(json|pdf)|resources/[A-Za-z0-9._-]+)$" },
+        "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+        "byteCount": { "type": "integer", "minimum": 0 }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}
