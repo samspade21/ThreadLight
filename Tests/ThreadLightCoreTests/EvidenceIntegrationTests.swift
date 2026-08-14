@@ -652,6 +652,63 @@ import ZIPFoundation
     #expect(try await destination.search(holdID: fixture.hold.id, query: .init(text: "approval")).count == 1)
 }
 
+@Test func concurrentReadsAndWritesShareOneConnectionSafely() async throws {
+    let fixture = try StoreFixture()
+    defer { fixture.cleanup() }
+    try await fixture.seed()
+    let store = fixture.store
+    let holdID = fixture.hold.id
+    let custodianID = fixture.custodian.id
+    let template = fixture.message
+
+    // One store is now shared by every window, so imports write while the interface searches
+    // and reloads custodians. Each of these paths reaches SQLite through the same connection.
+    await withTaskGroup(of: Void.self) { group in
+        for _ in 0..<6 {
+            group.addTask {
+                for _ in 0..<25 {
+                    _ = try? await store.search(holdID: holdID, query: .init(text: "approval"))
+                    _ = try? await store.conversations(holdID: holdID)
+                    _ = try? await store.attachmentAvailability(holdID: holdID)
+                }
+            }
+        }
+        for writer in 0..<2 {
+            group.addTask {
+                let archive = SourceArchive(
+                    holdID: holdID,
+                    custodianID: custodianID,
+                    originalFilename: "writer-\(writer).zip",
+                    sha256: String(repeating: "\(writer)", count: 64),
+                    coverageStart: nil,
+                    coverageEnd: nil,
+                    operatorBinding: "Legal Reviewer",
+                    isPerCustodian: false
+                )
+                try? await store.beginImport(archive)
+                for index in 0..<25 {
+                    var message = template
+                    message.text = "concurrent \(writer)-\(index)"
+                    _ = try? await store.insert(
+                        message: message,
+                        membership: .init(
+                            holdID: holdID,
+                            custodianID: custodianID,
+                            messageID: message.id,
+                            sourceArchiveID: archive.id
+                        )
+                    )
+                }
+                try? await store.completeImport(archive)
+            }
+        }
+    }
+
+    // A load check, not a reproducer: it does not reliably fail without the connection lock,
+    // so treat a failure here as real and an absence of failure as saying nothing.
+    #expect(try await store.search(holdID: holdID, query: .init(text: "approval")).count >= 1)
+}
+
 @Test func packagesFromEarlierFormatsAreRejected() async throws {
     let fixture = try StoreFixture()
     defer { fixture.cleanup() }

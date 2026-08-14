@@ -3,6 +3,15 @@ import SQLCipher
 
 public actor EvidenceStore {
     nonisolated(unsafe) private var database: OpaquePointer?
+    /// Serializes every use of the connection.
+    ///
+    /// The actor cannot do this. The handle and all of its helpers are nonisolated so `init`
+    /// can open and migrate the database before any actor context exists, which leaves
+    /// SQLite's own connection mutex as the only guard. That mutex makes a single call safe;
+    /// it does not stop another task's statements from landing between this one's
+    /// BEGIN IMMEDIATE and COMMIT, and it does not keep two tasks out of the cipher layer at
+    /// once. Recursive so a transaction can run the statements nested inside it.
+    nonisolated private let databaseLock = NSRecursiveLock()
     public let url: URL
 
     public init(url: URL, key: Data) throws {
@@ -949,6 +958,8 @@ public actor EvidenceStore {
     }
 
     nonisolated private func transaction(_ body: () throws -> Void) throws {
+        databaseLock.lock()
+        defer { databaseLock.unlock() }
         try execute("BEGIN IMMEDIATE")
         do {
             try body()
@@ -960,6 +971,8 @@ public actor EvidenceStore {
     }
 
     nonisolated private func execute(_ sql: String) throws {
+        databaseLock.lock()
+        defer { databaseLock.unlock() }
         guard let database else { throw ThreadLightError.database("Evidence database is closed.") }
         var errorPointer: UnsafeMutablePointer<CChar>?
         let status = sqlite3_exec(database, sql, nil, nil, &errorPointer)
@@ -1001,6 +1014,8 @@ public actor EvidenceStore {
     }
 
     nonisolated private func withStatement<T>(_ sql: String, _ values: [SQLiteValue], body: (OpaquePointer) throws -> T) throws -> T {
+        databaseLock.lock()
+        defer { databaseLock.unlock() }
         guard let database else { throw ThreadLightError.database("Evidence database is closed.") }
         var statement: OpaquePointer?
         guard sqlite3_prepare_v2(database, sql, -1, &statement, nil) == SQLITE_OK, let statement else { throw databaseError() }
