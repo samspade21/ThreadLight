@@ -438,7 +438,12 @@ import ZIPFoundation
 }
 
 @Test func encryptedHoldTransferAutoMatchesAndImportsNormalizedEvidence() async throws {
-    let source = try StoreFixture()
+    // Slack-length identifiers, because this test searches the encrypted package for them.
+    let source = try StoreFixture(
+        holdID: "H0A1B2C3D4E5",
+        organizationID: "E0A1B2C3D4E5",
+        custodianID: "U0A1B2C3D4E5"
+    )
     defer { source.cleanup() }
     try await source.seed()
     let transferURL = source.root.appending(path: "case.threadlight")
@@ -1645,15 +1650,19 @@ private final class StoreFixture: @unchecked Sendable {
     let archive: SourceArchive
     let message: EvidenceMessage
 
-    init() throws {
+    /// The short default identifiers keep the other tests readable. Any test that searches an
+    /// encrypted payload for an identifier must pass Slack-length ones instead: a two-byte
+    /// needle turns up in random ciphertext roughly once every 64 KB, so the search reports a
+    /// leak that is not there.
+    init(holdID: String = "H1", organizationID: String = "E1", custodianID: String = "U1") throws {
         root = FileManager.default.temporaryDirectory.appending(path: "ThreadLightTests-\(UUID())", directoryHint: .isDirectory)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         databaseURL = root.appending(path: "evidence.sqlite")
         store = try EvidenceStore(url: databaseURL, key: Data(repeating: 7, count: 32))
-        hold = .init(id: "H1", organizationID: "E1", name: "Investigation", status: .active, createdAt: .now, updatedAt: .now)
-        custodian = .init(id: "U1", holdID: "H1", displayName: "Alex Rivera")
-        archive = .init(holdID: "H1", custodianID: "U1", originalFilename: "alex.zip", sha256: String(repeating: "a", count: 64), coverageStart: nil, coverageEnd: nil, operatorBinding: "Reviewer", isPerCustodian: true)
-        message = .init(id: "M1", conversationID: "C1", conversationName: "general", conversationKind: .publicChannel, threadID: "C1:1", senderID: "U1", senderName: "Alex Rivera", text: "Please provide approval for the legal hold.", postedAt: Date(timeIntervalSince1970: 1_785_542_400))
+        hold = .init(id: holdID, organizationID: organizationID, name: "Investigation", status: .active, createdAt: .now, updatedAt: .now)
+        custodian = .init(id: custodianID, holdID: holdID, displayName: "Alex Rivera")
+        archive = .init(holdID: holdID, custodianID: custodianID, originalFilename: "alex.zip", sha256: String(repeating: "a", count: 64), coverageStart: nil, coverageEnd: nil, operatorBinding: "Reviewer", isPerCustodian: true)
+        message = .init(id: "M1", conversationID: "C1", conversationName: "general", conversationKind: .publicChannel, threadID: "C1:1", senderID: custodianID, senderName: "Alex Rivera", text: "Please provide approval for the legal hold.", postedAt: Date(timeIntervalSince1970: 1_785_542_400))
     }
 
     func seed() async throws {
