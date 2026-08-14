@@ -1,0 +1,114 @@
+name: Build and Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: SemVer from VERSION (for example, 0.3.0)
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  build-sign-notarize-release:
+    runs-on: macos-26
+    timeout-minutes: 60
+    environment: release
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate requested version
+        shell: zsh {0}
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          ./scripts/check-version.sh "$RELEASE_VERSION"
+
+      - name: Install Apple signing credentials
+        shell: zsh {0}
+        env:
+          MACOS_CERTIFICATE_BASE64: ${{ secrets.MACOS_CERTIFICATE_BASE64 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+          APPLE_API_KEY_BASE64: ${{ secrets.APPLE_API_KEY_BASE64 }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          for value in \
+            "$MACOS_CERTIFICATE_BASE64" \
+            "$MACOS_CERTIFICATE_PASSWORD" \
+            "$KEYCHAIN_PASSWORD" \
+            "$APPLE_API_KEY_BASE64" \
+            "$APPLE_API_KEY_ID" \
+            "$APPLE_API_ISSUER_ID"
+          do
+            [[ -n "$value" ]]
+          done
+
+          RELEASE_KEYCHAIN="$RUNNER_TEMP/threadlight-release.keychain-db"
+          CERTIFICATE_PATH="$RUNNER_TEMP/threadlight-release.p12"
+          API_KEY_PATH="$RUNNER_TEMP/AuthKey_${APPLE_API_KEY_ID}.p8"
+          print "RELEASE_KEYCHAIN=$RELEASE_KEYCHAIN" >> "$GITHUB_ENV"
+          print "CERTIFICATE_PATH=$CERTIFICATE_PATH" >> "$GITHUB_ENV"
+          print "API_KEY_PATH=$API_KEY_PATH" >> "$GITHUB_ENV"
+          print -rn -- "$MACOS_CERTIFICATE_BASE64" | base64 -D > "$CERTIFICATE_PATH"
+          print -rn -- "$APPLE_API_KEY_BASE64" | base64 -D > "$API_KEY_PATH"
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$RELEASE_KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$RELEASE_KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$RELEASE_KEYCHAIN"
+          security import "$CERTIFICATE_PATH" \
+            -k "$RELEASE_KEYCHAIN" \
+            -P "$MACOS_CERTIFICATE_PASSWORD" \
+            -T /usr/bin/codesign \
+            -T /usr/bin/security
+          security set-key-partition-list \
+            -S apple-tool:,apple: \
+            -s \
+            -k "$KEYCHAIN_PASSWORD" \
+            "$RELEASE_KEYCHAIN"
+          security list-keychains -d user -s "$RELEASE_KEYCHAIN"
+          security default-keychain -d user -s "$RELEASE_KEYCHAIN"
+
+          IDENTITY=$(security find-identity -v -p codesigning "$RELEASE_KEYCHAIN" | sed -n '1s/.*"\(.*\)"/\1/p')
+          [[ "$IDENTITY" == "Developer ID Application:"* ]]
+          xcrun notarytool store-credentials threadlight-ci \
+            --key "$API_KEY_PATH" \
+            --key-id "$APPLE_API_KEY_ID" \
+            --issuer "$APPLE_API_ISSUER_ID" \
+            --keychain "$RELEASE_KEYCHAIN"
+
+          print "CODE_SIGN_IDENTITY=$IDENTITY" >> "$GITHUB_ENV"
+          print "NOTARY_PROFILE=threadlight-ci" >> "$GITHUB_ENV"
+          print "THREADLIGHT_RELEASE_REPOSITORY=$GITHUB_REPOSITORY" >> "$GITHUB_ENV"
+
+      - name: Build and publish release
+        shell: zsh {0}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: ./scripts/release.sh "$RELEASE_VERSION"
+
+      - name: Remove temporary signing credentials
+        if: always()
+        shell: zsh {0}
+        run: |
+          rm -f "${CERTIFICATE_PATH:-$RUNNER_TEMP/threadlight-release.p12}"
+          if [[ -n "${API_KEY_PATH:-}" ]]; then
+            rm -f "$API_KEY_PATH"
+          else
+            rm -f "$RUNNER_TEMP"/AuthKey_*.p8(N)
+          fi
+          if [[ -n "${RELEASE_KEYCHAIN:-}" && -f "$RELEASE_KEYCHAIN" ]]; then
+            security delete-keychain "$RELEASE_KEYCHAIN"
+          fi

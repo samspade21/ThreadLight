@@ -2,6 +2,22 @@
 
 Production release is blocked until every gate below is complete.
 
+## Version policy
+
+ThreadLight follows Semantic Versioning and starts at `0.3.0`.
+
+- Patch (`0.3.0` → `0.3.1`): compatible bug and security fixes.
+- Minor (`0.3.0` → `0.4.0`): compatible features or meaningful workflow changes.
+- Major (`0.x` → `1.0.0`, then `1.x` → `2.0.0`): a declared stable release or an incompatible evidence/package/workflow change.
+
+`VERSION` is the release source of truth. The checked-in Info.plist must match it, and published tags use the same value with a `v` prefix. Bump and commit the version before releasing:
+
+```sh
+./scripts/bump-version.sh 0.3.1
+git add VERSION Config/Info.plist CHANGELOG.md
+git commit -m 'chore(release): bump version to 0.3.1'
+```
+
 ## Required gates
 
 - Enterprise Grid E2E: an Enterprise organization owner installs the customer-owned PKCE app; an account with Legal Holds access authorizes it; ThreadLight lists real policies and member entity IDs.
@@ -56,3 +72,30 @@ A Developer ID build now requires a notary profile and fails unless Apple's fina
 The ad-hoc build is for local testing only. It keeps OAuth tokens in macOS Keychain so sessions survive relaunches, while writing the database key to a plaintext local key file beside the database and signing evidence with ephemeral keys, which is why it must never hold real evidence. A rebuild may cause macOS to request Keychain authorization. It is not a distributable signed/notarized release and is not byte-for-byte comparable with a timestamped production signature.
 
 The reproducibility check compares every file in two ad-hoc app bundles built from the same checkout, lockfile, and local Swift/Xcode toolchain. Developer ID signatures and notarization tickets contain external timestamps and are verified for trust, not byte equality.
+
+## Publish from a maintainer Mac
+
+Install and authenticate GitHub CLI, and configure the Apple notary profile in the login Keychain. The checkout must be clean and the target release must not already exist.
+
+```sh
+gh auth login
+
+CODE_SIGN_IDENTITY='Developer ID Application: Example Corp (TEAMID)' \
+NOTARY_PROFILE='threadlight-notary' \
+./scripts/release.sh 0.3.0
+```
+
+`release.sh` is the common local/CI entry point. It calls `build-release.sh`, which resolves dependencies, runs release tests, builds the production app, validates and notarizes it, creates `ThreadLight-0.3.0.dmg`, signs and notarizes the DMG, writes its SHA-256 checksum, and runs final Apple validation. It then uses `gh release create` to create tag `v0.3.0`, generate release notes, and upload both artifacts to `samspade21/ThreadLight`.
+
+## Publish from GitHub Actions
+
+The **Build and Release** workflow uses only `workflow_dispatch`; it never publishes on a push or pull request. Before using it, create a protected GitHub environment named `release` and add:
+
+- `MACOS_CERTIFICATE_BASE64`: base64-encoded Developer ID Application `.p12`.
+- `MACOS_CERTIFICATE_PASSWORD`: password for that `.p12`.
+- `KEYCHAIN_PASSWORD`: throwaway password for the runner's temporary Keychain.
+- `APPLE_API_KEY_BASE64`: base64-encoded App Store Connect API `.p8` key.
+- `APPLE_API_KEY_ID`: App Store Connect API key ID.
+- `APPLE_API_ISSUER_ID`: App Store Connect issuer ID.
+
+From **Actions → Build and Release → Run workflow**, enter the exact version already committed in `VERSION`. The workflow imports credentials into an ephemeral Keychain, invokes the same `release.sh` used locally, and removes that Keychain afterward. GitHub's environment approval rules should require a maintainer before secrets are released to the job.

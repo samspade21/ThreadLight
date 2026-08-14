@@ -1,23 +1,48 @@
 # ThreadLight
 
-ThreadLight is a local, read-only macOS application for reviewing Slack Enterprise legal-hold exports. On the packaging Mac, an administrator selects a hold, adds one or more Slack ZIPs, normalizes them locally, and saves one encrypted `.threadlight-hold` file. On a managed review Mac, ThreadLight automatically matches that file against the holds the signed-in person can currently read, then provides local search plus flat PDF/JSON export or an optional tamper-evident signed evidence package.
+ThreadLight is a read-only Mac app for reviewing Slack Enterprise legal-hold exports. It lets a legal team search and inspect preserved Slack data without uploading the evidence to ThreadLight, an AI service, an analytics service, or a hosted review system.
 
-## Security boundary
+ThreadLight does not create legal holds or change Slack. Slack remains the system of record for the hold; ThreadLight is the local review tool.
 
-- ThreadLight never writes to Slack.
-- OAuth uses PKCE; no client secret is stored or shipped.
-- Tokens and database keys live in macOS Keychain.
-- OAuth tokens never cross computers. Each person signs in locally with an account allowed to read legal holds.
-- Evidence is stored in a SQLCipher database.
-- Each Slack Enterprise organization gets a distinct database key, encrypted database, resource vault, and retention clock. Startup purges every expired organization namespace, not only the last one opened; manual purge covers every known namespace.
-- Large JSON files stream through protected temporary storage; cancelled imports retain an invisible checkpoint and resume only from the identical hashed ZIP and binding.
-- Hold transfers use AES-GCM. The symmetric key is derived from the organization ID, hold ID, and sorted current member IDs; none of those identifiers appear in plaintext in the transfer.
-- Hold ID and member IDs are authorization-derived material, not high-entropy secrets. This gates normal app access through Slack but is not equivalent to a user-held private key if those identifiers leak.
-- Refreshing Slack invalidates and removes local evidence when a hold disappears or its current member set changes.
-- A record is exportable only when a freshly checked active hold, time window, conversation restriction, and source provenance all match.
-- Signatures prove that an export has not changed under the identified signing key. Record that key ID separately; signatures are not trusted timestamps or proof of operator identity.
+## Who uses it
 
-## Build
+- **A Slack administrator** creates the organization-owned Slack app, obtains approved Slack export ZIPs, and turns them into one encrypted ThreadLight package.
+- **A lawyer or reviewer** signs in to Slack, opens that package on a managed Mac, searches the messages, reviews conversations and threads, and exports selected evidence as PDF or JSON.
+
+## How it works
+
+1. The Slack administrator installs ThreadLight's supplied app manifest for the Enterprise organization. The app has read-only permissions.
+2. In **Settings → Prepare Packages**, the administrator chooses an active legal hold and drops in one or more untouched Slack export ZIP files.
+3. ThreadLight reads and normalizes those ZIPs on that Mac, then creates one encrypted `.threadlight-hold` file. A passphrase can be added for stronger transfer protection.
+4. The administrator sends that encrypted file to Legal through the organization's approved transfer channel.
+5. The reviewer signs in to Slack on their own Mac and drops the package into ThreadLight. The app only opens it when it matches a currently active hold and its current members.
+6. The reviewer searches locally by words, person, conversation, attachment, or date. Channels and direct messages stay grouped like Slack.
+7. Selected evidence can be saved as a PDF, JSON, or both. Evidence signing is optional and adds a manifest and signature for later tamper checking.
+
+## Privacy and network use
+
+Slack message evidence and attachments remain on the Macs handling the case. ThreadLight has no cloud service, telemetry service, hosted database, or developer-operated server. It does not upload the imported ZIPs, the encrypted hold package, search terms, messages, attachments, or evidence exports.
+
+ThreadLight does connect directly to **Slack's** cloud for sign-in and for read-only checks that the hold is still active. It also requests current names, email addresses, avatars, reactions, and workspace emoji. Those images are cached locally. That Slack traffic is unavoidable because Slack is the authority for the hold; no message evidence is sent from ThreadLight back to Slack. A user can still choose a cloud-synced folder or cloud transfer service when saving or moving a file, so organizational handling rules still apply.
+
+## Encryption in plain language
+
+- A signed production build creates a separate random encryption key for each Slack organization and stores that key in the macOS Keychain on that Mac.
+- Searchable message data is stored in an encrypted SQLCipher database. Imported attachment bytes are stored separately with AES-GCM encryption. The app decrypts data only when it needs to display or export it.
+- The `.threadlight-hold` transfer file is encrypted with AES-GCM. Its base key is derived from the Slack organization, the hold, and the hold's current member list. Those identifiers are not written in plaintext inside the package.
+- That base key prevents ordinary accidental access, but Slack administrators who already know all those identifiers may be able to reconstruct it. For confidential transport, add a strong passphrase and share it through a separate approved channel. ThreadLight strengthens the passphrase with PBKDF2 before using it.
+- If Slack reports that the hold disappeared or its member list changed, ThreadLight removes the old local evidence and requires a new package.
+- Optional evidence signatures detect later changes. They do not prove who operated the Mac and are not a trusted timestamp; compare the displayed signer key ID through a separate trusted record.
+
+Development builds deliberately use weaker local key storage and show a red warning. They must never be used with real evidence. Use only a Developer ID signed and Apple-notarized release for production data.
+
+## Install a release
+
+Download `ThreadLight-VERSION.dmg` and its `.sha256` file from [GitHub Releases](https://github.com/samspade21/ThreadLight/releases). Verify the checksum if your organization requires it, open the DMG, and drag ThreadLight into Applications. Production releases are signed with Apple Developer ID and notarized by Apple.
+
+ThreadLight requires Apple Silicon and macOS 26 or later. Slack setup is completed once by the organization's Slack administrator; see the [Slack administrator guide](docs/ADMIN_GUIDE.md).
+
+## Build for development
 
 Requirements: macOS 26, Apple Silicon, Xcode 26.6 or later with Swift 6.3.
 
@@ -32,13 +57,33 @@ open build/ThreadLight.app
 
 The build script accepts `CODE_SIGN_IDENTITY` and `NOTARY_PROFILE` environment variables. It performs an ad-hoc local signature when no Developer ID identity is supplied. A Developer ID build requires notarization and fails unless Apple accepts it, the ticket staples and validates, production entitlements pass, and Gatekeeper accepts the app. OAuth tokens use ThisDeviceOnly macOS Keychain storage in every build so sessions survive relaunches. Ad-hoc/debug builds write the evidence database key and resource-vault key to plaintext key files under Application Support instead of the Keychain, and sign evidence with ephemeral keys. The key sits beside the database it unlocks, so the encrypted store gives no protection at rest and these builds must never hold real evidence. They show a permanent red banner saying so. Developer ID builds use Keychain and Secure Enclave throughout. Never commit signing credentials.
 
+## Release maintainers
+
+ThreadLight uses [Semantic Versioning](https://semver.org/) and tags releases as `vMAJOR.MINOR.PATCH`. `VERSION` and the app's Info.plist must agree. To prepare a later release:
+
+```sh
+./scripts/bump-version.sh 0.3.1
+git add VERSION Config/Info.plist CHANGELOG.md
+git commit -m 'chore(release): bump version to 0.3.1'
+```
+
+After the version commit is on `main`, a maintainer can publish from a configured Mac. This runs the tests, builds with Developer ID, notarizes the app and DMG, creates the checksum, creates the `v0.3.1` tag, and uploads both files with `gh`:
+
+```sh
+CODE_SIGN_IDENTITY='Developer ID Application: Example Corp (TEAMID)' \
+NOTARY_PROFILE='threadlight-notary' \
+./scripts/release.sh 0.3.1
+```
+
+The same `release.sh` is used by the manual **Build and Release** GitHub Action. The GitHub `release` environment needs these secrets: `MACOS_CERTIFICATE_BASE64`, `MACOS_CERTIFICATE_PASSWORD`, `KEYCHAIN_PASSWORD`, `APPLE_API_KEY_BASE64`, `APPLE_API_KEY_ID`, and `APPLE_API_ISSUER_ID`. The workflow refuses dirty, mismatched, unsigned, unnotarized, or duplicate releases. See [the full release procedure](docs/RELEASE.md).
+
 The open-source `threadlight-verify` command checks package structure, every declared file hash, undeclared files, and the P-256 manifest signature. A valid result still requires comparing the reported signer key ID with a separately trusted record.
 
 ## Slack setup
 
 Each organization owns its Slack app and creates it from the single [`docs/slack-app-manifest.yaml`](docs/slack-app-manifest.yaml). The manifest contains organization deployment, PKCE, the ThreadLight callback, bot scope `team:read`, and read-only user scopes `admin.legal_holds:read`, `users:read`, `users:read.email`, `reactions:read`, and `emoji:read`. These provide legal holds, current profiles, live reactions, and workspace emoji. Install from that app's **Settings → Install App → Install to Organization** page. ThreadLight never stores or uses the bot token and never transfers OAuth tokens.
 
-After the connection is verified, ThreadLight generates a macOS `.mobileconfig` for MDM. It sets the public Client ID, organization identity, callback, required scope, and retention policy as forced preferences for `dev.threadlight.app`. On managed Macs, people launch ThreadLight and sign in to Slack; no setup-package import or manual Client ID entry is required. The profile contains no OAuth token, client secret, hold metadata, or evidence.
+After the connection is verified, ThreadLight generates a removable macOS `.mobileconfig` for MDM. It sets the public Client ID, organization identity, callback, required read-only scopes, and retention policy as forced preferences for `dev.threadlight.app`. On managed Macs, people launch ThreadLight and sign in to Slack; no setup-package import or manual Client ID entry is required. The profile contains no OAuth token, client secret, hold metadata, or evidence.
 
 Slack sessions persist in a ThisDeviceOnly macOS Keychain item across app relaunches. **ThreadLight → Log Out of Slack** removes that item while leaving local evidence encrypted on the Mac.
 

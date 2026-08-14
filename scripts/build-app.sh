@@ -10,6 +10,8 @@ MACOS_DIR="$CONTENTS_DIR/MacOS"
 FRAMEWORKS_DIR="$CONTENTS_DIR/Frameworks"
 RESOURCES_DIR="$CONTENTS_DIR/Resources"
 IDENTITY=${CODE_SIGN_IDENTITY:--}
+VERSION=$(<"$PROJECT_DIR/VERSION")
+"$PROJECT_DIR/scripts/check-version.sh" "$VERSION" >/dev/null
 
 if [[ "$IDENTITY" != "-" && -z "${NOTARY_PROFILE:-}" ]]; then
     print -u2 "A Developer ID build requires NOTARY_PROFILE; ThreadLight will not emit an unnotarized production app."
@@ -35,6 +37,8 @@ rm -rf "$APP_DIR"
 mkdir -p "$MACOS_DIR" "$FRAMEWORKS_DIR" "$RESOURCES_DIR"
 cp "$BIN_DIR/ThreadLight" "$MACOS_DIR/ThreadLight"
 cp "Config/Info.plist" "$CONTENTS_DIR/Info.plist"
+plutil -replace CFBundleShortVersionString -string "$VERSION" "$CONTENTS_DIR/Info.plist"
+plutil -replace CFBundleVersion -string "$VERSION" "$CONTENTS_DIR/Info.plist"
 cp "Config/ThreadLight.icns" "$RESOURCES_DIR/ThreadLight.icns"
 cp "Config/AppIcon.iconset/icon_512x512.png" "$RESOURCES_DIR/SlackAppIcon.png"
 cp "Sources/ThreadLightApp/Resources/setup-journey.png" "$RESOURCES_DIR/setup-journey.png"
