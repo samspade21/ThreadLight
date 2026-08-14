@@ -9,6 +9,12 @@ ThreadLight follows [Semantic Versioning](https://semver.org/). Published releas
 - The local evidence database uses schema version 5 and there is no upgrade path. ThreadLight clears an older local database and starts blank; re-import the untouched source ZIPs. A database created by a newer ThreadLight is still refused, never deleted.
 - The hold transfer format changed again and earlier `.threadlight` packages no longer open. The payload is now sealed as framed chunks whose order and end are authenticated, so a reordered or truncated package fails to open instead of decoding to something plausible. Export packages again from 0.5.0.
 
+### Fixed
+
+- Quitting while a purge, import, or package was still writing crashed inside the encrypted database engine: process exit tears down SQLCipher's global state under the running statement. ThreadLight now finishes evidence work before quitting and says so in the status bar. Purging also announces itself instead of looking hung.
+- A Slack sign-in gone stale surfaced as "A JavaScript exception occurred" and aborted packaging with no way to tell what happened. It now reports what failed and says to sign in to Slack again.
+- The copyable error report carried placeholders where its diagnostics should be. It now includes the underlying error detail, the app's recent activity, and its own recent log lines, and still tells the operator to review for case details before sharing.
+
 ### Changed
 
 - Importing a Slack export is more than twice as fast. The store caches prepared statements, commits under WAL with synchronous NORMAL, and no longer pays SQLCipher's per-allocation memory locking (`cipher_memory_security` is off: FileVault and macOS encrypted swap already cover plaintext at rest, and the setting doubled import time).

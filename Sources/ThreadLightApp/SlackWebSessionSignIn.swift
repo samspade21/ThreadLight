@@ -152,6 +152,20 @@ final class SlackWebSessionSignIn: NSObject {
             )
         } catch {
             ThreadLightLog.session.error("web session call failed: method=\(method, privacy: .public) category=\(ThreadLightLog.category(of: error), privacy: .public)")
+            let nsError = error as NSError
+            if nsError.domain == WKError.errorDomain, nsError.code == WKError.Code.javaScriptExceptionOccurred.rawValue {
+                // Raw WKError surfaces as "A JavaScript exception occurred", which reads like a
+                // crash and says nothing actionable. The JS message carries the real cause —
+                // most commonly the session tap timing out because the signed-in Slack page has
+                // gone stale — and the fix is always the same: sign in again.
+                let jsMessage = nsError.userInfo["WKJavaScriptExceptionMessage"] as? String
+                throw ThreadLightError.slack(
+                    "Slack's web session could not complete \(method). "
+                        + (jsMessage ?? "The Slack page reported a script error.")
+                        + " The saved Slack sign-in has likely gone stale — sign in to Slack again, then retry.",
+                    remediation: "Sign in to Slack again, then retry."
+                )
+            }
             throw error
         }
         guard let jsonString = value as? String, let data = jsonString.data(using: .utf8) else {

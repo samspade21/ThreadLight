@@ -687,6 +687,32 @@ import ZIPFoundation
     #expect(try await store.search(holdID: holdID, query: .init(text: "approval")).count >= 1)
 }
 
+@Test func repeatedImportPackagePurgeSequenceSurvives() async throws {
+    // Mirrors a reported in-app crash: several ZIPs imported into one hold, an encrypted
+    // package exported, then a purge, which died inside SQLCipher's page codec.
+    let fixture = try StoreFixture()
+    defer { fixture.cleanup() }
+    try await fixture.store.save(hold: fixture.hold)
+    try await fixture.store.replaceCustodians([fixture.custodian], holdID: fixture.hold.id)
+    for round in 0..<3 {
+        let zip = try fixture.makeBulkSlackExport(round: round, messageCount: 2_500)
+        _ = try await SlackExportImporter(store: fixture.store).importHoldArchive(
+            url: zip,
+            hold: fixture.hold,
+            operatorBinding: "Reviewer"
+        )
+        let destination = fixture.root.appending(path: "package-\(round).threadlight")
+        _ = try await HoldTransferService(store: fixture.store).export(
+            hold: fixture.hold,
+            custodians: [fixture.custodian],
+            destination: destination
+        )
+    }
+    try await fixture.store.purge()
+    #expect(try await fixture.store.holds().isEmpty)
+    #expect(try await fixture.store.search(holdID: fixture.hold.id, query: .init(text: "approval")).isEmpty)
+}
+
 @Test func packagesFromEarlierFormatsAreRejected() async throws {
     let fixture = try StoreFixture()
     defer { fixture.cleanup() }
@@ -1705,6 +1731,26 @@ private final class StoreFixture: @unchecked Sendable {
         try #"[{"user":"U1","text":"second direct message","ts":"1785542400.000200"}]"#
             .write(to: second.appending(path: "2026-08-01.json"), atomically: true, encoding: .utf8)
         let zip = root.appending(path: "slack-dm-collision-export.zip")
+        try FileManager.default.zipItem(at: source, to: zip, shouldKeepParent: false)
+        return zip
+    }
+
+    /// A hold-wide export with enough messages to cross importer batch boundaries. Rounds
+    /// overlap so re-imported messages exercise the dedup path, as staged exports do.
+    func makeBulkSlackExport(round: Int, messageCount: Int) throws -> URL {
+        let source = root.appending(path: "slack-bulk-\(round)", directoryHint: .isDirectory)
+        let channel = source.appending(path: "general", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: channel, withIntermediateDirectories: true)
+        try #"[{"id":"U1","name":"alex","profile":{"real_name":"Alex Rivera"}}]"#.write(to: source.appending(path: "users.json"), atomically: true, encoding: .utf8)
+        try #"[{"id":"C1","name":"general"}]"#.write(to: source.appending(path: "channels.json"), atomically: true, encoding: .utf8)
+        var rows: [String] = []
+        rows.reserveCapacity(messageCount)
+        let start = 1_785_542_400 + round * (messageCount - 500)
+        for index in 0..<messageCount {
+            rows.append(#"{"user":"U1","text":"bulk approval message \#(start + index)","ts":"\#(start + index).000100"}"#)
+        }
+        try ("[" + rows.joined(separator: ",") + "]").write(to: channel.appending(path: "2026-08-01.json"), atomically: true, encoding: .utf8)
+        let zip = root.appending(path: "slack-bulk-\(round).zip")
         try FileManager.default.zipItem(at: source, to: zip, shouldKeepParent: false)
         return zip
     }

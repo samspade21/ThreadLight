@@ -17,8 +17,28 @@ private extension FocusedValues {
     }
 }
 
+/// Holds app termination while an evidence-critical operation (import, packaging, purge) is
+/// still running. exit() runs SQLCipher's atexit teardown, which frees its global state under
+/// any statement still executing on another thread — quitting mid-purge crashed in the field
+/// with a SIGSEGV inside the page codec.
+@MainActor
+final class TerminationGuard: NSObject, NSApplicationDelegate {
+    var model: AppModel?
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard let model, model.criticalOperationCount > 0 else { return .terminateNow }
+        model.statusMessage = "Finishing evidence work, then quitting…"
+        Task { @MainActor in
+            await model.awaitCriticalWorkCompletion()
+            sender.reply(toApplicationShouldTerminate: true)
+        }
+        return .terminateLater
+    }
+}
+
 @main
 struct ThreadLightApplication: App {
+    @NSApplicationDelegateAdaptor(TerminationGuard.self) private var terminationGuard
     /// One model for the whole app. Each scene used to build its own, which opened a second
     /// EvidenceStore on the same encrypted database and a second Slack session: work done in
     /// Settings was invisible to the main window, and errors raised there had no alert to
@@ -28,6 +48,7 @@ struct ThreadLightApplication: App {
     var body: some Scene {
         WindowGroup {
             WorkspaceWindow(model: model)
+                .onAppear { terminationGuard.model = model }
         }
         .defaultSize(width: 1_320, height: 820)
         .windowStyle(.hiddenTitleBar)
@@ -43,6 +64,7 @@ struct ThreadLightApplication: App {
 
         Settings {
             SettingsWorkspace(model: model)
+                .onAppear { terminationGuard.model = model }
         }
     }
 }

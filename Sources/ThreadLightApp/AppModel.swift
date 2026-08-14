@@ -105,7 +105,17 @@ final class AppModel {
     /// Full copyable diagnostics for the last error, and its type on its own for issue titles.
     private(set) var lastErrorReport = ""
     private(set) var lastErrorCategory = "unknown"
-    var statusMessage = "Complete setup to begin."
+    var statusMessage = "Complete setup to begin." {
+        didSet { recordActivity(statusMessage) }
+    }
+    /// Timestamped recent status messages, embedded in error reports so "what the app was
+    /// doing" is answered by the app instead of left as a placeholder for the operator.
+    private var recentActivity: [String] = []
+    /// Evidence-critical operations in flight (imports, packaging, purges). Quitting the app
+    /// waits for these: exit() during live SQLCipher work runs its atexit teardown under a
+    /// running statement, which crashed in the field (SIGSEGV in sqlite3Codec).
+    private(set) var criticalOperationCount = 0
+    private var criticalWorkContinuations: [CheckedContinuation<Void, Never>] = []
     var retentionDays: Int {
         didSet { UserDefaults.standard.set(retentionDays, forKey: Self.retentionDaysKey) }
     }
@@ -642,7 +652,11 @@ final class AppModel {
             return false
         }
         importProgress = nil
-        defer { importProgress = nil }
+        beginCriticalWork()
+        defer {
+            importProgress = nil
+            endCriticalWork()
+        }
         var imported = 0
         var skipped = 0
         var messageCount = 0
@@ -883,7 +897,11 @@ final class AppModel {
             return false
         }
         let access = destination.startAccessingSecurityScopedResource()
-        defer { if access { destination.stopAccessingSecurityScopedResource() } }
+        beginCriticalWork()
+        defer {
+            if access { destination.stopAccessingSecurityScopedResource() }
+            endCriticalWork()
+        }
         ThreadLightLog.transfer.notice(
             "destination scoped=\(access, privacy: .public) passphrase=\(passphrase != nil, privacy: .public)"
         )
@@ -916,7 +934,11 @@ final class AppModel {
     func importHoldTransfer(from url: URL) async {
         guard let store, let legalHoldClient else { return }
         let access = url.startAccessingSecurityScopedResource()
-        defer { if access { url.stopAccessingSecurityScopedResource() } }
+        beginCriticalWork()
+        defer {
+            if access { url.stopAccessingSecurityScopedResource() }
+            endCriticalWork()
+        }
         do {
             var passphrase: String?
             if try HoldTransferService.requiresPassphrase(url: url) {
@@ -1077,7 +1099,11 @@ final class AppModel {
     private func exportConversationPDF(conversationID: String, to destination: URL) async {
         guard let hold = selectedHold, let store else { return }
         let access = destination.startAccessingSecurityScopedResource()
-        defer { if access { destination.stopAccessingSecurityScopedResource() } }
+        beginCriticalWork()
+        defer {
+            if access { destination.stopAccessingSecurityScopedResource() }
+            endCriticalWork()
+        }
         do {
             guard let legalHoldClient else {
                 throw ThreadLightError.scope("Reconnect Slack before exporting so ThreadLight can confirm the hold is still active.")
@@ -1122,7 +1148,11 @@ final class AppModel {
     ) async {
         guard let hold = selectedHold, let store else { return }
         let access = destination.startAccessingSecurityScopedResource()
-        defer { if access { destination.stopAccessingSecurityScopedResource() } }
+        beginCriticalWork()
+        defer {
+            if access { destination.stopAccessingSecurityScopedResource() }
+            endCriticalWork()
+        }
         var selected: [EvidenceMessage] = []
         do {
             guard let legalHoldClient else {
@@ -1253,6 +1283,9 @@ final class AppModel {
     }
 
     func purgeEvidence() async {
+        beginCriticalWork()
+        defer { endCriticalWork() }
+        statusMessage = "Purging local evidence…"
         do {
             holdLoadTask?.cancel()
             threadLoadTask?.cancel()
@@ -1365,32 +1398,71 @@ final class AppModel {
         NSWorkspace.shared.open(url)
     }
 
+    private func recordActivity(_ message: String) {
+        recentActivity.append("\(ISO8601DateFormatter().string(from: Date())) \(message)")
+        if recentActivity.count > 12 { recentActivity.removeFirst(recentActivity.count - 12) }
+    }
+
+    private func beginCriticalWork() { criticalOperationCount += 1 }
+
+    private func endCriticalWork() {
+        criticalOperationCount -= 1
+        guard criticalOperationCount == 0 else { return }
+        let waiters = criticalWorkContinuations
+        criticalWorkContinuations = []
+        for waiter in waiters { waiter.resume() }
+    }
+
+    /// Suspends until no evidence-critical operation is running. Used by the termination
+    /// guard so quitting cannot tear SQLCipher down under a live statement.
+    func awaitCriticalWorkCompletion() async {
+        guard criticalOperationCount > 0 else { return }
+        await withCheckedContinuation { criticalWorkContinuations.append($0) }
+    }
+
     private func show(_ error: Error) {
         let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
         let category = ThreadLightLog.category(of: error)
         errorMessage = message
         lastErrorCategory = category
-        lastErrorReport = Self.diagnosticReport(message: message, category: category)
+        lastErrorReport = diagnosticReport(message: message, category: category, error: error)
         isShowingError = true
     }
 
-    private static func diagnosticReport(message: String, category: String) -> String {
+    private func diagnosticReport(message: String, category: String, error: Error) -> String {
         let timestamp = ISO8601DateFormatter().string(from: Date())
+        var details: [String] = []
+        if !(error is ThreadLightError) {
+            let nsError = error as NSError
+            if let jsMessage = nsError.userInfo["WKJavaScriptExceptionMessage"] as? String {
+                details.append("JavaScript: \(jsMessage)")
+            }
+            if let underlying = nsError.userInfo[NSUnderlyingErrorKey] as? NSError {
+                details.append("Underlying: \(underlying.domain)#\(underlying.code) \(underlying.localizedDescription)")
+            }
+        }
+        let logLines = ThreadLightLog.recentLogLines()
         return """
         ThreadLight error report
 
         What failed: \(message)
-        Error type: \(category)
+        Error type: \(category)\(details.isEmpty ? "" : "\nError detail: " + details.joined(separator: "; "))
         When: \(timestamp)
         App: \(ThreadLightBuild.applicationIdentity)
         macOS: \(ProcessInfo.processInfo.operatingSystemVersionString)
 
-        What I was doing:
-        (describe the steps here)
+        Recent app activity:
+        \(recentActivity.isEmpty ? "(none recorded)" : recentActivity.joined(separator: "\n"))
 
         Recent log lines:
-        (run this in Terminal and paste the output)
-        log show --predicate 'subsystem == "dev.threadlight.app"' --last 30m --info
+        \(logLines.isEmpty
+            ? "(none captured — run: log show --predicate 'subsystem == \"dev.threadlight.app\"' --last 30m --info)"
+            : logLines.joined(separator: "\n"))
+
+        Anything else you were doing:
+        (add details here)
+
+        Review before sharing: activity above can name holds or files from your case.
         """
     }
 

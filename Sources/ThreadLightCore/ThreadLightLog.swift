@@ -1,5 +1,6 @@
 import Foundation
 import os
+import OSLog
 
 /// Diagnostic logging for the long-running operations a user cannot otherwise observe.
 ///
@@ -25,6 +26,23 @@ public enum ThreadLightLog {
     public static let transfer = Logger(subsystem: subsystem, category: "transfer")
     /// Sign-in, hold refresh, and storage lifecycle, which can interrupt the two above.
     public static let session = Logger(subsystem: subsystem, category: "session")
+
+    /// This process's own recent log entries, formatted for an error report. Reading the
+    /// current-process store needs no special entitlement, and by this subsystem's logging
+    /// policy the entries carry stages, counts, and categories — never evidence content.
+    /// The report embedding them is still shown to the operator before anything is shared.
+    public static func recentLogLines(minutes: Int = 30, limit: Int = 40) -> [String] {
+        guard let store = try? OSLogStore(scope: .currentProcessIdentifier) else { return [] }
+        let position = store.position(date: Date().addingTimeInterval(-Double(minutes) * 60))
+        guard let entries = try? store.getEntries(at: position) else { return [] }
+        let formatter = ISO8601DateFormatter()
+        var lines: [String] = []
+        for entry in entries {
+            guard let log = entry as? OSLogEntryLog, log.subsystem == subsystem else { continue }
+            lines.append("\(formatter.string(from: log.date)) [\(log.category)] \(log.composedMessage)")
+        }
+        return Array(lines.suffix(limit))
+    }
 
     /// Categorizes an error without emitting its message, which may quote evidence.
     public static func category(of error: Error) -> String {
