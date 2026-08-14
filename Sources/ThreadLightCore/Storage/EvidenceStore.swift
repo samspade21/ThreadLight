@@ -22,6 +22,18 @@ public actor EvidenceStore {
     public init(url: URL, key: Data) throws {
         self.url = url
         try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        do {
+            try openAndMigrate(key: key)
+        } catch is OutdatedSchemaError {
+            // There is no upgrade path from an earlier schema; evidence is rebuilt from the
+            // untouched source ZIPs. A database from a NEWER schema is still refused above,
+            // because deleting it would destroy evidence a newer ThreadLight manages.
+            try Self.removeDatabaseFiles(at: url)
+            try openAndMigrate(key: key)
+        }
+    }
+
+    nonisolated private func openAndMigrate(key: Data) throws {
         var handle: OpaquePointer?
         let flags = SQLITE_OPEN_CREATE | SQLITE_OPEN_READWRITE | SQLITE_OPEN_FULLMUTEX
         guard sqlite3_open_v2(url.path, &handle, flags, nil) == SQLITE_OK, let handle else {
@@ -43,9 +55,21 @@ public actor EvidenceStore {
             try verifyCipher()
             try migrate()
         } catch {
+            // Cached statements belong to this handle; keeping them across a reopen would
+            // leave stale pointers behind.
+            for statement in statementCache.values { sqlite3_finalize(statement) }
+            statementCache = [:]
             sqlite3_close(handle)
             database = nil
             throw error
+        }
+    }
+
+    nonisolated private static func removeDatabaseFiles(at url: URL) throws {
+        for candidate in [url, URL(fileURLWithPath: url.path + "-wal"), URL(fileURLWithPath: url.path + "-shm")] {
+            if FileManager.default.fileExists(atPath: candidate.path) {
+                try FileManager.default.removeItem(at: candidate)
+            }
         }
     }
 
@@ -66,12 +90,7 @@ public actor EvidenceStore {
         guard ThreadLightBuild.isValidStorageNamespace(organizationID) else {
             throw ThreadLightError.database("The local evidence storage namespace is invalid.")
         }
-        let url = try defaultURL(organizationID: organizationID)
-        for candidate in [url, URL(fileURLWithPath: url.path + "-wal"), URL(fileURLWithPath: url.path + "-shm")] {
-            if FileManager.default.fileExists(atPath: candidate.path) {
-                try FileManager.default.removeItem(at: candidate)
-            }
-        }
+        try removeDatabaseFiles(at: defaultURL(organizationID: organizationID))
         try await keychain.delete(account: "evidence.database.\(organizationID)")
     }
 
@@ -742,10 +761,11 @@ public actor EvidenceStore {
 
     nonisolated private func migrate() throws {
         let currentVersion: Int64 = try firstRow("PRAGMA user_version") { sqlite3_column_int64($0, 0) } ?? 0
-        guard currentVersion == 0 || currentVersion == Self.schemaVersion else {
-            throw ThreadLightError.database(
-                "This evidence database uses an incompatible ThreadLight schema (version \(currentVersion)). Delete it and re-import the untouched source ZIPs."
-            )
+        guard currentVersion <= Self.schemaVersion else {
+            throw ThreadLightError.database("This evidence database was created by a newer ThreadLight schema version.")
+        }
+        if currentVersion != 0, currentVersion != Self.schemaVersion {
+            throw OutdatedSchemaError()
         }
         guard currentVersion == 0 else { return }
         try execute(
@@ -1128,6 +1148,10 @@ public actor EvidenceStore {
         return decoder
     }()
 }
+
+/// Signals a readable database on an earlier schema. Caught only inside `init`, where the
+/// database is cleared and recreated blank.
+private struct OutdatedSchemaError: Error {}
 
 private enum SQLiteValue {
     case null

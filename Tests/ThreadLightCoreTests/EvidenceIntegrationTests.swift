@@ -258,31 +258,46 @@ import ZIPFoundation
     #expect(try await fixture.store.attachmentAvailability(holdID: fixture.hold.id) == (referenced: 1, available: 1))
 }
 
-@Test func incompatibleSchemaVersionDatabaseIsRejected() async throws {
+@Test func outdatedSchemaDatabaseIsClearedAndRecreatedBlank() async throws {
     let root = FileManager.default.temporaryDirectory.appending(path: "ThreadLightMigration-\(UUID())", directoryHint: .isDirectory)
     try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
     defer { try? FileManager.default.removeItem(at: root) }
     let databaseURL = root.appending(path: "evidence.sqlite")
     let key = Data(repeating: 6, count: 32)
+    let hold = LegalHold(id: "HM", organizationID: "EM", name: "Outdated", status: .active, createdAt: .now, updatedAt: .now)
     do {
-        _ = try EvidenceStore(url: databaseURL, key: key)
+        let original = try EvidenceStore(url: databaseURL, key: key)
+        try await original.save(hold: hold)
     }
     await Task.yield()
 
-    var rawDatabase: OpaquePointer?
-    #expect(sqlite3_open(databaseURL.path, &rawDatabase) == SQLITE_OK)
-    let keyHex = key.map { String(format: "%02x", $0) }.joined()
-    let downgradeSQL = """
-    PRAGMA key = "x'\(keyHex)'";
-    PRAGMA user_version = 4;
-    """
-    #expect(sqlite3_exec(rawDatabase, downgradeSQL, nil, nil, nil) == SQLITE_OK)
-    #expect(sqlite3_close(rawDatabase) == SQLITE_OK)
+    func setSchemaVersion(_ version: Int) throws {
+        var rawDatabase: OpaquePointer?
+        #expect(sqlite3_open(databaseURL.path, &rawDatabase) == SQLITE_OK)
+        let keyHex = key.map { String(format: "%02x", $0) }.joined()
+        #expect(sqlite3_exec(rawDatabase, "PRAGMA key = \"x'\(keyHex)'\"; PRAGMA user_version = \(version);", nil, nil, nil) == SQLITE_OK)
+        #expect(sqlite3_close(rawDatabase) == SQLITE_OK)
+    }
 
-    // There is no upgrade path; evidence databases are rebuilt from the untouched source ZIPs.
+    // There is no upgrade path from an earlier schema. The database is cleared and the app
+    // starts blank; evidence is rebuilt from the untouched source ZIPs.
+    try setSchemaVersion(4)
+    do {
+        let recreated = try EvidenceStore(url: databaseURL, key: key)
+        #expect(try await recreated.holds().isEmpty)
+        try await recreated.save(hold: hold)
+    }
+    await Task.yield()
+
+    // A database created by a NEWER ThreadLight is refused, never deleted: it holds evidence
+    // that a newer version manages.
+    try setSchemaVersion(6)
     #expect(throws: (any Error).self) {
         _ = try EvidenceStore(url: databaseURL, key: key)
     }
+    try setSchemaVersion(5)
+    let preserved = try EvidenceStore(url: databaseURL, key: key)
+    #expect(try await preserved.holds().map(\.id) == [hold.id])
 }
 
 @Test func wrongDatabaseKeyCannotReadEvidence() async throws {
