@@ -2,6 +2,20 @@
 
 ThreadLight follows [Semantic Versioning](https://semver.org/). Published releases use tags such as `v0.3.0` and include GitHub-generated release notes.
 
+## 0.5.0
+
+### Breaking
+
+- The local evidence database uses schema version 5 and there is no upgrade path. ThreadLight refuses an older database and says to delete it and re-import the untouched source ZIPs.
+- The hold transfer format changed again and earlier `.threadlight` packages no longer open. The payload is now sealed as framed chunks whose order and end are authenticated, so a reordered or truncated package fails to open instead of decoding to something plausible. Export packages again from 0.5.0.
+
+### Changed
+
+- Importing a Slack export is more than twice as fast. The store caches prepared statements, commits under WAL with synchronous NORMAL, and no longer pays SQLCipher's per-allocation memory locking (`cipher_memory_security` is off: FileVault and macOS encrypted swap already cover plaintext at rest, and the setting doubled import time).
+- Opening a hold is faster and stays fast on large holds. The conversation list aggregates over a covering index instead of decrypting every message row, and thread lookups have their own index.
+- A message's raw Slack JSON is stored beside the message instead of inside its serialized form, so search and thread reads no longer decode it. JSON evidence exports still include it unchanged.
+- Building an evidence export no longer re-reads the same source archives once per message, which large exports felt as minutes of manifest preparation.
+
 ## 0.4.1
 
 ### Fixed
