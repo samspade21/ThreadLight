@@ -218,10 +218,24 @@ public actor RefreshingLegalHoldClient: LegalHoldClient {
 public actor SlackLegalHoldClient: LegalHoldClient {
     private var accessToken: String
     private let session: URLSession
+    private let webSessionTransport: (@Sendable (String, [String: String]) async throws -> Data)?
 
     public init(accessToken: String, session: URLSession = .shared) {
         self.accessToken = accessToken
         self.session = session
+        self.webSessionTransport = nil
+    }
+
+    /// Routes every call through a live, cookie-authenticated Slack web session instead of an
+    /// OAuth bearer token — for a signed-in person whose own Slack role can use Slack's admin
+    /// console (e.g. a Legal Holds Admin) but cannot complete OAuth for `admin.legal_holds:read`,
+    /// which Slack restricts to Org Owners regardless of what that person's role otherwise permits.
+    /// The transport returns raw JSON `Data` (not `[String: Any]`, which isn't `Sendable`) since it
+    /// crosses from a `@MainActor`-isolated web view into this actor.
+    public init(webSessionTransport: @Sendable @escaping (String, [String: String]) async throws -> Data) {
+        self.accessToken = ""
+        self.session = .shared
+        self.webSessionTransport = webSessionTransport
     }
 
     public func replaceAccessToken(_ token: String) {
@@ -362,6 +376,20 @@ public actor SlackLegalHoldClient: LegalHoldClient {
     }
 
     private func call(method: String, fields: [String: String]) async throws -> [String: Any] {
+        let data = try await fetchData(method: method, fields: fields)
+        guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw ThreadLightError.slack("Slack returned an unreadable response.", remediation: "Try again. If this continues, give sanitized diagnostics to the Slack Admin Role.")
+        }
+        guard object["ok"] as? Bool == true else {
+            throw SlackErrorMapper.error(for: object["error"] as? String ?? "unknown_error")
+        }
+        return object
+    }
+
+    private func fetchData(method: String, fields: [String: String]) async throws -> Data {
+        if let webSessionTransport {
+            return try await webSessionTransport(method, fields)
+        }
         var request = URLRequest(url: URL(string: "https://slack.com/api/\(method)")!)
         request.httpMethod = "POST"
         request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
@@ -379,13 +407,7 @@ public actor SlackLegalHoldClient: LegalHoldClient {
                 continue
             }
             try HTTPValidation.requireSuccess(response: response, data: data)
-            guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-                throw ThreadLightError.slack("Slack returned an unreadable response.", remediation: "Try again. If this continues, give sanitized diagnostics to the Slack Admin Role.")
-            }
-            guard object["ok"] as? Bool == true else {
-                throw SlackErrorMapper.error(for: object["error"] as? String ?? "unknown_error")
-            }
-            return object
+            return data
         }
     }
 

@@ -296,54 +296,36 @@ private struct MissingConfigurationView: View {
 
 private struct SlackSignInView: View {
     @Environment(AppModel.self) private var model
-    @State private var isSigningIn = false
-    @State private var pastedCallback = ""
 
     var body: some View {
-        if model.pendingSignIn == nil {
-            ContentUnavailableView {
-                Label("Sign in to Slack", systemImage: "person.crop.circle.badge.checkmark")
-            } description: {
-                Text("Sign in to see the legal holds available to you.")
-            } actions: {
-                Button("Sign in to Slack") {
-                    model.beginSlackSignIn()
-                }
-                .buttonStyle(.borderedProminent)
-                .tint(ThreadLightTheme.violet)
+        ContentUnavailableView {
+            Label("Sign in to Slack", systemImage: "person.crop.circle.badge.checkmark")
+        } description: {
+            Text("Sign in to see the legal holds available to you.")
+        } actions: {
+            Button(model.webSessionSignIn == nil ? "Sign in to Slack" : "Signing in…") {
+                model.beginSlackWebSessionSignIn()
             }
-        } else {
-            ContentUnavailableView {
-                Label("Finish signing in", systemImage: "link.circle")
-            } description: {
-                Text("After you approve ThreadLight, the browser lands on a page that cannot be reached — that is expected and safe. Copy the entire address from the browser's address bar and paste it here.")
-            } actions: {
-                VStack(spacing: 10) {
-                    TextField("https://callback.threadlight.invalid/oauth/callback?code=…", text: $pastedCallback)
-                        .textFieldStyle(.roundedBorder)
-                        .font(.system(.body, design: .monospaced))
-                        .frame(maxWidth: 460)
-                    HStack {
-                        Button(isSigningIn ? "Signing in…" : "Complete Sign-In") {
-                            isSigningIn = true
-                            Task {
-                                await model.completeSlackSignIn(pastedCallback: pastedCallback)
-                                if model.pendingSignIn == nil { pastedCallback = "" }
-                                isSigningIn = false
-                            }
-                        }
-                        .buttonStyle(.borderedProminent)
-                        .tint(ThreadLightTheme.violet)
-                        .disabled(pastedCallback.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || isSigningIn)
-                        Button("Cancel") {
-                            model.cancelSlackSignIn()
-                            pastedCallback = ""
-                        }
-                        .disabled(isSigningIn)
-                    }
+            .buttonStyle(.borderedProminent)
+            .tint(ThreadLightTheme.violet)
+            .disabled(model.webSessionSignIn != nil)
+        }
+        .sheet(isPresented: webSessionSheetPresented) {
+            if let signIn = model.webSessionSignIn {
+                SlackWebSessionSheet(signIn: signIn) {
+                    model.cancelSlackWebSessionSignIn()
                 }
             }
         }
+    }
+
+    private var webSessionSheetPresented: Binding<Bool> {
+        Binding(
+            get: { model.webSessionSignIn?.isPresented ?? false },
+            set: { newValue in
+                if !newValue { model.cancelSlackWebSessionSignIn() }
+            }
+        )
     }
 }
 

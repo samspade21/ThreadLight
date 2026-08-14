@@ -93,7 +93,7 @@ struct SlackAppInstallationSettingsView: View {
                         HStack {
                             Link("Open Slack apps", destination: SlackAppManifest.createAppURL)
                             Button {
-                                model.beginSlackSignIn()
+                                model.beginSlackWebSessionSignIn()
                             } label: {
                                 Label(connectionButtonTitle, systemImage: model.isConnected ? "checkmark.circle.fill" : "person.crop.circle.badge.checkmark")
                             }
@@ -104,8 +104,31 @@ struct SlackAppInstallationSettingsView: View {
                                     || isConnecting
                                     || model.isConnected
                                     || model.pendingSignIn != nil
+                                    || model.webSessionSignIn != nil
                                     || setup.requiresAdministratorSignerConfirmation
                             )
+                        }
+                        Text("Signs in through Slack's own site inside ThreadLight. Works for a Legal Holds Admin who is not a Slack organization owner.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+
+                        DisclosureGroup("Installing the app to the organization for the first time?") {
+                            VStack(alignment: .leading, spacing: 8) {
+                                Text("Only needed once, by a Slack organization owner, before anyone can use the sign-in above.")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                Button("Install to organization…") {
+                                    model.beginSlackSignIn()
+                                }
+                                .disabled(
+                                    !hasAppDetails
+                                        || isConnecting
+                                        || model.isConnected
+                                        || model.pendingSignIn != nil
+                                        || setup.requiresAdministratorSignerConfirmation
+                                )
+                            }
+                            .padding(.top, 4)
                         }
 
                         if model.pendingSignIn != nil, !model.isConnected {
@@ -180,9 +203,25 @@ struct SlackAppInstallationSettingsView: View {
             }
         }
         .accessibilityIdentifier("settings.slackAppInstallation")
+        .sheet(isPresented: webSessionSheetPresented) {
+            if let signIn = model.webSessionSignIn {
+                SlackWebSessionSheet(signIn: signIn) {
+                    model.cancelSlackWebSessionSignIn()
+                }
+            }
+        }
         .onChange(of: setup.organizationName) { setup.save() }
         .onChange(of: setup.organizationDomain) { setup.save() }
         .onChange(of: setup.slackClientID) { setup.save() }
+    }
+
+    private var webSessionSheetPresented: Binding<Bool> {
+        Binding(
+            get: { model.webSessionSignIn?.isPresented ?? false },
+            set: { newValue in
+                if !newValue { model.cancelSlackWebSessionSignIn() }
+            }
+        )
     }
 
     private var hasAppDetails: Bool {
@@ -194,7 +233,7 @@ struct SlackAppInstallationSettingsView: View {
     private var connectionButtonTitle: String {
         if isConnecting { return "Signing in…" }
         if model.isConnected { return "Slack verified" }
-        if model.pendingSignIn != nil { return "Waiting for sign-in…" }
+        if model.pendingSignIn != nil || model.webSessionSignIn != nil { return "Waiting for sign-in…" }
         return "Sign in and verify"
     }
 }

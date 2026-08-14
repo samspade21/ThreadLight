@@ -120,6 +120,7 @@ final class AppModel {
     private(set) var completedPackageCount = 0
     private(set) var currentOrganizationID: String?
     private(set) var pendingSignIn: OAuthAttempt?
+    private(set) var webSessionSignIn: SlackWebSessionSignIn?
 
     private var store: EvidenceStore?
     private var resourceVault: ResourceVault?
@@ -257,6 +258,66 @@ final class AppModel {
         statusMessage = "Slack sign-in canceled."
     }
 
+    /// For a signed-in person whose Slack role (e.g. Legal Holds Admin) can use Slack's own admin
+    /// console but cannot complete OAuth for `admin.legal_holds:read` — Slack restricts that OAuth
+    /// grant to Org Owners regardless of role. Reads the same data through that live web session
+    /// instead. See `SlackWebSessionSignIn`.
+    func beginSlackWebSessionSignIn() {
+        guard let enterpriseID = setup.expectedOrganizationID, !enterpriseID.isEmpty else {
+            show(ThreadLightError.invalidConfiguration("This Mac has no expected Slack organization yet. Complete setup first."))
+            return
+        }
+        let signIn = SlackWebSessionSignIn()
+        webSessionSignIn = signIn
+        Task {
+            do {
+                try await signIn.beginSignIn(enterpriseID: enterpriseID)
+                try await finishWebSessionConnection(signIn: signIn, organizationID: enterpriseID)
+                ThreadLightLog.session.notice("web session sign-in: connected")
+            } catch {
+                if webSessionSignIn === signIn { webSessionSignIn = nil }
+                if !(error is CancellationError) { show(error) }
+                ThreadLightLog.session.error("web session sign-in: failed category=\(ThreadLightLog.category(of: error), privacy: .public)")
+            }
+        }
+    }
+
+    func cancelSlackWebSessionSignIn() {
+        webSessionSignIn?.cancel()
+        webSessionSignIn = nil
+    }
+
+    private func finishWebSessionConnection(signIn: SlackWebSessionSignIn, organizationID: String) async throws {
+        let client = SlackLegalHoldClient(webSessionTransport: { method, fields in
+            try await signIn.call(method: method, fields: fields)
+        })
+        let loadedHolds = try await client.listPolicies(status: nil)
+        try setup.recordValidatedOrganizationID(organizationID)
+        try await openStorage(organizationID: organizationID)
+        legalHoldClient = client
+        isConnected = true
+        Task { await refreshSlackEmojiCatalog() }
+        let currentHoldIDs = Set(loadedHolds.map(\.id))
+        for oldHold in try await store?.holds() ?? [] where !currentHoldIDs.contains(oldHold.id) {
+            _ = try await store?.purgeEvidence(holdID: oldHold.id)
+        }
+        holds = loadedHolds
+        for hold in loadedHolds {
+            try await store?.save(hold: hold)
+            if hold.status == .active {
+                let currentCustodians = try await client.listCustodians(policyID: hold.id)
+                _ = try await reconcileCustodians(currentCustodians, for: hold)
+            }
+        }
+        setup.update(.internalApp, state: .ready)
+        setup.update(.pkce, state: .ready)
+        setup.update(.readScope, state: .ready)
+        setup.update(.enterpriseInstall, state: .ready, message: "Slack returned \(loadedHolds.count) legal hold policies.")
+        statusMessage = "Signed in to Slack. Choose a legal hold or import its encrypted package."
+        touchActivity()
+        selectDefaultHold()
+    }
+
     func logOut() async {
         do {
             try await tokenVault.remove(organizationID: "current")
@@ -264,6 +325,8 @@ final class AppModel {
             threadLoadTask?.cancel()
             legalHoldClient = nil
             pendingSignIn = nil
+            webSessionSignIn?.cancel()
+            webSessionSignIn = nil
             isShowingImportReport = false
             isShowingExportOptions = false
             queryText = ""
@@ -396,6 +459,21 @@ final class AppModel {
         } catch is CancellationError {
             return
         } catch { show(error) }
+    }
+
+    /// Prefers a live-fetched Slack profile name, then the custodian's own stored name, then a
+    /// name recovered from an already-loaded message they sent — falls back to nil (unresolved,
+    /// e.g. still loading) rather than ever showing the raw Slack ID as a name.
+    func resolvedCustodianName(for custodian: Custodian) -> String? {
+        let candidates = [
+            slackUserProfiles[custodian.id]?.displayName,
+            custodian.displayName,
+            messages.first(where: { $0.senderID == custodian.id })?.senderName,
+        ]
+        return candidates.compactMap { value in
+            let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed?.isEmpty == false && trimmed != custodian.id ? trimmed : nil
+        }.first
     }
 
     func search(loadMore: Bool = false) async {

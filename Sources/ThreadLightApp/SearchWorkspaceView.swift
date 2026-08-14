@@ -245,6 +245,7 @@ private struct HoldHeader: View {
     let hold: LegalHold
     let isLegalHoldListHidden: Bool
     let showLegalHolds: () -> Void
+    @State private var isShowingCustodianList = false
 
     var body: some View {
         HStack(spacing: 12) {
@@ -283,49 +284,27 @@ private struct HoldHeader: View {
                         .font(.caption)
                         .foregroundStyle(ThreadLightTheme.dangerForeground)
                 } else {
-                    ScrollView(.horizontal, showsIndicators: false) {
-                        HStack(spacing: 6) {
-                            ForEach(model.custodians) { custodian in
-                                if let name = resolvedName(for: custodian) {
-                                    let profile = model.slackUserProfiles[custodian.id]
-                                    let email = profile?.email ?? custodian.email
-                                    Button {
-                                        NSPasteboard.general.clearContents()
-                                        let identity = [name, "Slack ID: \(custodian.id)", email.map { "Email: \($0)" }]
-                                            .compactMap { $0 }
-                                            .joined(separator: "\n")
-                                        NSPasteboard.general.setString(identity, forType: .string)
-                                    } label: {
-                                        HStack(spacing: 5) {
-                                            SlackAvatar(
-                                                name: name,
-                                                userID: custodian.id,
-                                                url: profile?.avatarURL ?? custodian.avatarURL,
-                                                size: 18
-                                            )
-                                            Text(name)
-                                        }
-                                            .font(.caption2)
-                                            .padding(.horizontal, 7).padding(.vertical, 3)
-                                            .foregroundStyle(ThreadLightTheme.accentForeground)
-                                            .background(ThreadLightTheme.violet.opacity(0.08), in: Capsule())
-                                    }
-                                    .buttonStyle(.plain)
-                                    .help([name, "Slack ID: \(custodian.id)", email.map { "Email: \($0)" }].compactMap { $0 }.joined(separator: "\n"))
-                                    .accessibilityLabel("Copy \(name), Slack ID, and email")
-                                }
-                            }
+                    Button {
+                        isShowingCustodianList = true
+                    } label: {
+                        HStack(spacing: 5) {
+                            Image(systemName: "person.2.fill")
+                            Text("\(model.custodians.count) \(model.custodians.count == 1 ? "person" : "people")")
                             if unresolvedCustodianCount > 0 {
-                                HStack(spacing: 5) {
-                                    ProgressView().controlSize(.mini)
-                                    Text("Loading \(unresolvedCustodianCount) name\(unresolvedCustodianCount == 1 ? "" : "s")…")
-                                }
-                                .font(.caption2)
-                                .foregroundStyle(.secondary)
+                                ProgressView().controlSize(.mini)
                             }
                         }
+                        .font(.caption2)
+                        .padding(.horizontal, 8).padding(.vertical, 4)
+                        .foregroundStyle(ThreadLightTheme.accentForeground)
+                        .background(ThreadLightTheme.violet.opacity(0.08), in: Capsule())
                     }
-                    .frame(minWidth: 120, maxWidth: 300, alignment: .trailing)
+                    .buttonStyle(.plain)
+                    .help("Show everyone under this hold")
+                    .accessibilityLabel("Show all \(model.custodians.count) custodians")
+                    .popover(isPresented: $isShowingCustodianList) {
+                        CustodianListPopover(custodians: model.custodians)
+                    }
                 }
             }
         }
@@ -348,19 +327,78 @@ private struct HoldHeader: View {
     }
 
     private var unresolvedCustodianCount: Int {
-        model.custodians.count { resolvedName(for: $0) == nil }
+        model.custodians.count { model.resolvedCustodianName(for: $0) == nil }
     }
+}
 
-    private func resolvedName(for custodian: Custodian) -> String? {
-        let candidates = [
-            model.slackUserProfiles[custodian.id]?.displayName,
-            custodian.displayName,
-            model.messages.first(where: { $0.senderID == custodian.id })?.senderName,
-        ]
-        return candidates.compactMap { value in
-            let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines)
-            return trimmed?.isEmpty == false && trimmed != custodian.id ? trimmed : nil
-        }.first
+/// Lists every custodian under a hold — the header's "N people" button opens this instead of the
+/// old horizontal-scrolling chip row, which left anyone past ~300pt of width unreachable.
+private struct CustodianListPopover: View {
+    @Environment(AppModel.self) private var model
+    let custodians: [Custodian]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Text("\(custodians.count) \(custodians.count == 1 ? "person" : "people") under this hold")
+                .font(.headline)
+                .padding(.horizontal, 16)
+                .padding(.top, 14)
+                .padding(.bottom, 10)
+            Divider()
+            ScrollView {
+                VStack(alignment: .leading, spacing: 0) {
+                    ForEach(custodians) { custodian in
+                        CustodianRow(custodian: custodian)
+                        if custodian.id != custodians.last?.id { Divider().padding(.leading, 44) }
+                    }
+                }
+            }
+        }
+        .frame(width: 320, height: min(CGFloat(custodians.count) * 44 + 60, 420))
+    }
+}
+
+private struct CustodianRow: View {
+    @Environment(AppModel.self) private var model
+    let custodian: Custodian
+
+    var body: some View {
+        let name = model.resolvedCustodianName(for: custodian) ?? custodian.id
+        let profile = model.slackUserProfiles[custodian.id]
+        let email = profile?.email ?? custodian.email
+        Button {
+            NSPasteboard.general.clearContents()
+            let identity = [name, "Slack ID: \(custodian.id)", email.map { "Email: \($0)" }]
+                .compactMap { $0 }
+                .joined(separator: "\n")
+            NSPasteboard.general.setString(identity, forType: .string)
+        } label: {
+            HStack(spacing: 10) {
+                SlackAvatar(
+                    name: name,
+                    userID: custodian.id,
+                    url: profile?.avatarURL ?? custodian.avatarURL,
+                    size: 24
+                )
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(name)
+                        .font(.callout)
+                        .foregroundStyle(.primary)
+                    if let email {
+                        Text(email)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                Spacer(minLength: 8)
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 8)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help("Copy \(name), Slack ID, and email")
+        .accessibilityLabel("Copy \(name), Slack ID, and email")
     }
 }
 
