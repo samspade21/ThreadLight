@@ -2,6 +2,13 @@
 
 ThreadLight follows [Semantic Versioning](https://semver.org/). Published releases use tags such as `v0.3.0` and include GitHub-generated release notes.
 
+## 0.4.1
+
+### Fixed
+
+- Slack sign-in no longer leaves the org/workspace picker to whatever happens to be active in the browser. The authorization URL now pins the org this Mac's MDM profile expects, so a non-admin approving in the wrong context can no longer get silently issued a workspace-scoped token that `admin.legalHold.*` then rejects.
+- A custodian's or message sender's resolved name could be replaced by their Slack display name (often a nickname or handle) after a live profile refresh, even when their real name had already been resolved correctly. Every name resolution path now prefers Slack's real name first.
+
 ## 0.4.0
 
 ### Breaking
