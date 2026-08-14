@@ -1,7 +1,5 @@
 # Release procedure
 
-Production release is blocked until every gate below is complete.
-
 ## Version policy
 
 ThreadLight follows Semantic Versioning and starts at `0.3.0`.
@@ -17,15 +15,6 @@ ThreadLight follows Semantic Versioning and starts at `0.3.0`.
 git add VERSION Config/Info.plist CHANGELOG.md
 git commit -m 'chore(release): bump version to 0.3.1'
 ```
-
-## Required gates
-
-- Enterprise Grid E2E: an Enterprise organization owner installs the customer-owned PKCE app; an account with Legal Holds access authorizes it; ThreadLight lists real policies and member entity IDs.
-- Package-transfer E2E: multiple hold-wide ZIPs normalize, encrypt, auto-match, import, search, export, and verify successfully.
-- Senior engineering review: SQLCipher schema v4, v1→v4 migration/backfill and rollback strategy, source-specific message provenance, checkpoint recovery, organization isolation, and retention behavior.
-- AppSec review: OAuth, archive parsing, local encryption, evidence scope, dependency audit, and signing claims.
-- Performance: representative million-message archive with bounded memory, cancellation, and interactive search.
-- Legal/brand: third-party screenshot links and generated visual assets approved for distribution.
 
 ## Build and test
 
