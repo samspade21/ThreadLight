@@ -19,9 +19,15 @@ private extension FocusedValues {
 
 @main
 struct ThreadLightApplication: App {
+    /// One model for the whole app. Each scene used to build its own, which opened a second
+    /// EvidenceStore on the same encrypted database and a second Slack session: work done in
+    /// Settings was invisible to the main window, and errors raised there had no alert to
+    /// surface them.
+    @State private var model = AppModel()
+
     var body: some Scene {
         WindowGroup {
-            WorkspaceWindow()
+            WorkspaceWindow(model: model)
         }
         .defaultSize(width: 1_320, height: 820)
         .windowStyle(.hiddenTitleBar)
@@ -30,25 +36,51 @@ struct ThreadLightApplication: App {
         }
 
         WindowGroup("Conversation", for: ConversationWindowRequest.self) { request in
-            WorkspaceWindow(initialConversation: request.wrappedValue)
+            WorkspaceWindow(model: model, initialConversation: request.wrappedValue)
         }
         .defaultSize(width: 1_140, height: 760)
         .windowStyle(.hiddenTitleBar)
-        .commands {
-            ThreadLightCommands()
-        }
 
         Settings {
-            SettingsWorkspace()
+            SettingsWorkspace(model: model)
         }
     }
 }
 
+/// Presents whatever the model last failed at. Every scene that can start work needs this,
+/// or that scene's failures are silent.
+private struct ThreadLightErrorAlert: ViewModifier {
+    @Bindable var model: AppModel
+
+    func body(content: Content) -> some View {
+        content.alert("ThreadLight ran into a problem", isPresented: $model.isShowingError) {
+            Button("Copy Error Report") { model.copyErrorReport() }
+            Button("Report a Bug…") { model.openIssueReport() }
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text("""
+            \(model.errorMessage ?? "Something went wrong. Please try again.")
+
+            If this looks like a bug, choose Copy Error Report and open an issue at \
+            github.com/samspade21/ThreadLight/issues so it can be fixed. Read the copied \
+            report first and remove anything case related before posting it publicly.
+            """)
+        }
+    }
+}
+
+private extension View {
+    func threadLightErrorAlert(_ model: AppModel) -> some View {
+        modifier(ThreadLightErrorAlert(model: model))
+    }
+}
+
 private struct WorkspaceWindow: View {
-    @State private var model = AppModel()
+    let model: AppModel
     let initialConversation: ConversationWindowRequest?
 
-    init(initialConversation: ConversationWindowRequest? = nil) {
+    init(model: AppModel, initialConversation: ConversationWindowRequest? = nil) {
+        self.model = model
         self.initialConversation = initialConversation
     }
 
@@ -89,7 +121,7 @@ struct DevelopmentBuildBanner: View {
 }
 
 private struct SettingsWorkspace: View {
-    @State private var model = AppModel()
+    let model: AppModel
 
     var body: some View {
         SettingsView()
@@ -97,6 +129,7 @@ private struct SettingsWorkspace: View {
             .focusedSceneValue(\.threadLightModel, model)
             .frame(width: 760, height: 680)
             .task { await model.start() }
+            .threadLightErrorAlert(model)
     }
 }
 
@@ -147,17 +180,11 @@ private struct RootView: View {
                     conversationID: initialConversation.conversationID
                 )
             }
-            while !Task.isCancelled {
-                try? await Task.sleep(for: .seconds(900))
-                guard !Task.isCancelled else { return }
-                await model.refreshLegalHolds()
-            }
+            // Owned by the model so opening a second window does not start a second
+            // refresh loop against the same shared state.
+            model.beginPeriodicHoldRefresh()
         }
-        .alert("ThreadLight", isPresented: $model.isShowingError) {
-            Button("OK", role: .cancel) {}
-        } message: {
-            Text(model.errorMessage ?? "Something went wrong. Please try again.")
-        }
+        .threadLightErrorAlert(model)
     }
 }
 

@@ -102,6 +102,9 @@ final class AppModel {
     var isConnected = false
     var isShowingError = false
     var errorMessage: String?
+    /// Full copyable diagnostics for the last error, and its type on its own for issue titles.
+    private(set) var lastErrorReport = ""
+    private(set) var lastErrorCategory = "unknown"
     var statusMessage = "Complete setup to begin."
     var retentionDays: Int {
         didSet { UserDefaults.standard.set(retentionDays, forKey: Self.retentionDaysKey) }
@@ -126,6 +129,8 @@ final class AppModel {
     private var holdLoadTask: Task<Void, Never>?
     private var threadLoadTask: Task<Void, Never>?
     private var packageTask: Task<Void, Never>?
+    private var refreshTask: Task<Void, Never>?
+    private var hasStarted = false
     private var searchGeneration = 0
     private var activeStorageNamespace: String?
     private var requestedConversation: (holdID: String, conversationID: String)?
@@ -161,6 +166,10 @@ final class AppModel {
     }
 
     func start() async {
+        // Every scene calls this, and they now share one model. Opening a second store on the
+        // same encrypted database is what made Settings work invisible to the main window.
+        guard !hasStarted else { return }
+        hasStarted = true
         defer { isStarting = false }
         var expiredProfiles = 0
         do {
@@ -601,6 +610,19 @@ final class AppModel {
             )
             show(error)
             return false
+        }
+    }
+
+    /// Refreshes holds from Slack every 15 minutes. Runs once for the whole app, however many
+    /// windows are open.
+    func beginPeriodicHoldRefresh() {
+        guard refreshTask == nil else { return }
+        refreshTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(900))
+                guard !Task.isCancelled, let self else { return }
+                await self.refreshLegalHolds()
+            }
         }
     }
 
@@ -1215,8 +1237,61 @@ final class AppModel {
     }
 
     private func show(_ error: Error) {
-        errorMessage = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+        let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+        let category = ThreadLightLog.category(of: error)
+        errorMessage = message
+        lastErrorCategory = category
+        lastErrorReport = Self.diagnosticReport(message: message, category: category)
         isShowingError = true
+    }
+
+    private static func diagnosticReport(message: String, category: String) -> String {
+        let timestamp = ISO8601DateFormatter().string(from: Date())
+        return """
+        ThreadLight error report
+
+        What failed: \(message)
+        Error type: \(category)
+        When: \(timestamp)
+        App: \(ThreadLightBuild.applicationIdentity)
+        macOS: \(ProcessInfo.processInfo.operatingSystemVersionString)
+
+        What I was doing:
+        (describe the steps here)
+
+        Recent log lines:
+        (run this in Terminal and paste the output)
+        log show --predicate 'subsystem == "dev.threadlight.app"' --last 30m --info
+        """
+    }
+
+    /// Copies the report locally so the operator can read it before deciding what to share.
+    /// "What failed" can quote a path from inside a Slack export, so ThreadLight never sends
+    /// it anywhere on its own.
+    func copyErrorReport() {
+        guard !lastErrorReport.isEmpty else { return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(lastErrorReport, forType: .string)
+        statusMessage = "Copied the error report. Review it for case details before pasting it into a public issue."
+    }
+
+    /// Opens a new GitHub issue prefilled with build and error type only. The operator pastes
+    /// the copied report themselves, so nothing derived from a legal hold is published without
+    /// them seeing it first.
+    func openIssueReport() {
+        var components = URLComponents(string: "https://github.com/samspade21/ThreadLight/issues/new")
+        components?.queryItems = [
+            URLQueryItem(name: "title", value: "Error: \(lastErrorCategory)"),
+            URLQueryItem(name: "body", value: """
+            App: \(ThreadLightBuild.applicationIdentity)
+            macOS: \(ProcessInfo.processInfo.operatingSystemVersionString)
+            Error type: \(lastErrorCategory)
+
+            Paste the copied error report here, after removing anything case related:
+            """),
+        ]
+        guard let url = components?.url else { return }
+        NSWorkspace.shared.open(url)
     }
 
     private func refreshEvidenceReadiness(for hold: LegalHold) async throws {
