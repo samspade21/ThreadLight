@@ -3,18 +3,13 @@ import Compression
 import CryptoKit
 import Foundation
 
-/// Naming for the encrypted transfer file.
-///
-/// ThreadLight writes `.threadlight` and opens either extension, so packages handed to a
-/// recipient before the rename keep working. The format itself is identified by the magic
-/// bytes, not the file name.
+/// Naming for the encrypted transfer file. The format itself is identified by the magic bytes,
+/// not the file name.
 public enum HoldTransferFile {
     public static let pathExtension = "threadlight"
-    public static let legacyPathExtension = "threadlight-hold"
 
     public static func isTransfer(_ url: URL) -> Bool {
-        let found = url.pathExtension.lowercased()
-        return found == pathExtension || found == legacyPathExtension
+        url.pathExtension.lowercased() == pathExtension
     }
 }
 
@@ -39,10 +34,8 @@ public struct HoldTransferService: Sendable {
     /// content compress about ten to one, and encrypted output cannot be compressed afterwards,
     /// so an uncompressed payload threw that away and pushed packages toward the size ceiling.
     private static let magic = Data("THREADLIGHT-HOLD-3\n".utf8)
-    /// Version 2 is uncompressed and carries a schema 1 snapshot. Still readable so packages
-    /// already handed to a recipient keep opening; never written.
-    static let uncompressedMagic = Data("THREADLIGHT-HOLD-2\n".utf8)
-    private static let legacyMagic = Data("THREADLIGHT-HOLD-1\n".utf8)
+    /// Earlier formats are recognized only to say so. ThreadLight cannot read them.
+    private static let supersededMagic = Data("THREADLIGHT-HOLD-".utf8)
     private static let saltCount = 32
     private static let maximumBytes = 2 * 1_024 * 1_024 * 1_024
     /// OWASP's PBKDF2-HMAC-SHA256 floor. Derived once per transfer, not once per candidate hold.
@@ -94,8 +87,8 @@ public struct HoldTransferService: Sendable {
         guard let header = try handle.read(upToCount: magic.count + 1), header.count == magic.count + 1 else {
             throw ThreadLightError.archive("This is not a supported ThreadLight hold transfer.")
         }
-        guard header.starts(with: magic) || header.starts(with: uncompressedMagic) else {
-            if header.starts(with: legacyMagic) {
+        guard header.starts(with: magic) else {
+            if header.starts(with: supersededMagic) {
                 throw ThreadLightError.archive("This hold transfer was created by an older ThreadLight build. Ask the sender to create a new package.")
             }
             throw ThreadLightError.archive("This is not a supported ThreadLight hold transfer.")
@@ -115,9 +108,8 @@ public struct HoldTransferService: Sendable {
             throw ThreadLightError.archive("Choose a regular ThreadLight hold transfer no larger than 2 GB.")
         }
         let data = try Data(contentsOf: url, options: [.mappedIfSafe])
-        let isCompressed = data.starts(with: Self.magic)
-        guard isCompressed || data.starts(with: Self.uncompressedMagic) else {
-            if data.starts(with: Self.legacyMagic) {
+        guard data.starts(with: Self.magic) else {
+            if data.starts(with: Self.supersededMagic) {
                 throw ThreadLightError.archive("This hold transfer was created by an older ThreadLight build. Ask the sender to create a new package.")
             }
             throw ThreadLightError.archive("This is not a supported ThreadLight hold transfer.")
@@ -154,22 +146,12 @@ public struct HoldTransferService: Sendable {
                         stretchedPassphrase: stretched
                     )
                 )
-                let cleartext = isCompressed
-                    ? try Self.inflate(opened, limit: Self.maximumBytes)
-                    : opened
+                let cleartext = try Self.inflate(opened, limit: Self.maximumBytes)
                 // Decoding must reproduce the sealed bytes exactly, so a package cannot carry
                 // fields ThreadLight ignores or an ordering it did not write.
-                let snapshot: HoldTransferSnapshot
-                if isCompressed {
-                    let decoded = try CanonicalJSON.decoder.decode(HoldTransferSnapshot.self, from: cleartext)
-                    guard cleartext == (try CanonicalJSON.encode(decoded)) else { continue }
-                    snapshot = decoded
-                } else {
-                    let decoded = try CanonicalJSON.decoder.decode(LegacyHoldTransferSnapshot.self, from: cleartext)
-                    guard cleartext == (try CanonicalJSON.encode(decoded)), decoded.schemaVersion == 1 else { continue }
-                    snapshot = decoded.modernized()
-                }
-                guard snapshot.schemaVersion == HoldTransferSnapshot.schemaVersion,
+                let snapshot = try CanonicalJSON.decoder.decode(HoldTransferSnapshot.self, from: cleartext)
+                guard cleartext == (try CanonicalJSON.encode(snapshot)),
+                      snapshot.schemaVersion == HoldTransferSnapshot.schemaVersion,
                       snapshot.holdID == candidate.hold.id,
                       snapshot.organizationID == candidate.hold.organizationID,
                       snapshot.holdFingerprint == HoldAccessKey.fingerprint(
@@ -206,7 +188,7 @@ public struct HoldTransferService: Sendable {
     /// to anyone with Legal Holds access or Slack audit-log access. Such a person can rebuild
     /// the key and decrypt the package. Passing a passphrase, shared out of band, is what makes
     /// the file confidential against someone who already knows those identifiers.
-    static func key(
+    private static func key(
         hold: LegalHold,
         custodians: [Custodian],
         salt: Data,
@@ -351,37 +333,3 @@ public struct HoldTransferSnapshot: Codable, Sendable {
     }
 }
 
-/// The schema 1 shape, read so packages written before messages were deduplicated still import.
-/// ThreadLight never writes it again.
-struct LegacyHoldTransferSnapshot: Codable, Sendable {
-    let schemaVersion: Int
-    let createdAt: Date
-    let holdID: String
-    let organizationID: String
-    let holdFingerprint: String
-    let archives: [SourceArchive]
-    let records: [HoldTransferRecord]
-
-    func modernized() -> HoldTransferSnapshot {
-        var seen = Set<String>()
-        var messages: [EvidenceMessage] = []
-        for record in records where seen.insert(record.message.id).inserted {
-            messages.append(record.message)
-        }
-        return HoldTransferSnapshot(
-            schemaVersion: HoldTransferSnapshot.schemaVersion,
-            createdAt: createdAt,
-            holdID: holdID,
-            organizationID: organizationID,
-            holdFingerprint: holdFingerprint,
-            archives: archives,
-            messages: messages.sorted { $0.id < $1.id },
-            memberships: records.map(\.membership)
-        )
-    }
-}
-
-public struct HoldTransferRecord: Codable, Sendable {
-    public let message: EvidenceMessage
-    public let membership: HoldMembership
-}

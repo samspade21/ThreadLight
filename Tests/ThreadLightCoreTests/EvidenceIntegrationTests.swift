@@ -652,57 +652,24 @@ import ZIPFoundation
     #expect(try await destination.search(holdID: fixture.hold.id, query: .init(text: "approval")).count == 1)
 }
 
-@Test func uncompressedSchemaOneHoldTransferStillImports() async throws {
+@Test func supersededHoldTransferFormatsSaySoRatherThanLookingCorrupt() async throws {
     let fixture = try StoreFixture()
     defer { fixture.cleanup() }
-    try await fixture.seed()
-    let modern = try await fixture.store.transferSnapshot(
-        hold: fixture.hold,
-        custodians: [fixture.custodian],
-        fingerprint: HoldAccessKey.fingerprint(hold: fixture.hold, custodians: [fixture.custodian])
-    )
-    // Rebuild the shape ThreadLight wrote before messages were deduplicated and the payload
-    // was compressed, so packages already delivered to a recipient keep opening.
-    let messages = Dictionary(modern.messages.map { ($0.id, $0) }) { first, _ in first }
-    let legacy = LegacyHoldTransferSnapshot(
-        schemaVersion: 1,
-        createdAt: modern.createdAt,
-        holdID: modern.holdID,
-        organizationID: modern.organizationID,
-        holdFingerprint: modern.holdFingerprint,
-        archives: modern.archives,
-        records: modern.memberships.compactMap { membership in
-            messages[membership.messageID].map { HoldTransferRecord(message: $0, membership: membership) }
-        }
-    )
-    let cleartext = try CanonicalJSON.encode(legacy)
-    let salt = SymmetricKey(size: .bits256).withUnsafeBytes { Data($0) }
-    let key = HoldTransferService.key(
-        hold: fixture.hold,
-        custodians: [fixture.custodian],
-        salt: salt,
-        stretchedPassphrase: nil
-    )
-    var package = HoldTransferService.uncompressedMagic
+    let url = fixture.root.appending(path: "old.threadlight")
+    // A package from an earlier format version. ThreadLight cannot read it, but recognizing the
+    // prefix is what turns "this is not a ThreadLight file" into "ask for a new package".
+    var package = Data("THREADLIGHT-HOLD-2\n".utf8)
     package.append(0)
-    package.append(salt)
-    package.append(try AES.GCM.seal(cleartext, using: key).combined!)
-    // Written under the old file extension too, which import still accepts.
-    let legacyURL = fixture.root.appending(path: "legacy.threadlight-hold")
-    try package.write(to: legacyURL)
-    #expect(HoldTransferFile.isTransfer(legacyURL))
-    #expect(try HoldTransferService.requiresPassphrase(url: legacyURL) == false)
+    package.append(Data(repeating: 3, count: 64))
+    try package.write(to: url)
 
-    let destination = try EvidenceStore(
-        url: fixture.root.appending(path: "legacy-reader.sqlite"),
-        key: Data(repeating: 11, count: 32)
-    )
-    let result = try await HoldTransferService(store: destination).importTransfer(
-        url: legacyURL,
-        candidates: [.init(hold: fixture.hold, custodians: [fixture.custodian])]
-    )
-    #expect(result.hold.id == fixture.hold.id)
-    #expect(try await destination.search(holdID: fixture.hold.id, query: .init(text: "approval")).count == 1)
+    #expect(throws: ThreadLightError.self) { _ = try HoldTransferService.requiresPassphrase(url: url) }
+    do {
+        _ = try await HoldTransferService(store: fixture.store).importTransfer(url: url, candidates: [])
+        Issue.record("An earlier package format should not import.")
+    } catch let error as ThreadLightError {
+        #expect(error.errorDescription?.contains("older ThreadLight build") == true)
+    }
 }
 
 @Test func renamedCopyOfAnImportedExportIsReportedAsADuplicate() async throws {
