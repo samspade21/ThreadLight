@@ -110,6 +110,11 @@ final class AppModel {
     var isShowingExportOptions = false
     var lastImportReport: ImportReport?
     var importProgress: ImportProgress?
+    /// Packaging owns a multi-minute import plus an export, so the model holds the task.
+    /// A transient sheet cannot outlive it, and its outcome is always reported.
+    private(set) var isPackaging = false
+    /// Increments only after a package is written, so the staged ZIP list clears exactly once.
+    private(set) var completedPackageCount = 0
     private(set) var currentOrganizationID: String?
     private(set) var pendingSignIn: OAuthAttempt?
 
@@ -120,6 +125,7 @@ final class AppModel {
     private let quickLook = QuickLookPresenter()
     private var holdLoadTask: Task<Void, Never>?
     private var threadLoadTask: Task<Void, Never>?
+    private var packageTask: Task<Void, Never>?
     private var searchGeneration = 0
     private var activeStorageNamespace: String?
     private var requestedConversation: (holdID: String, conversationID: String)?
@@ -208,11 +214,15 @@ final class AppModel {
                     _ = try await reconcileCustodians(currentCustodians, for: hold)
                 }
             }
-            statusMessage = "Slack connection restored."
+            ThreadLightLog.session.notice("slack session restored: holds=\(loadedHolds.count, privacy: .public)")
+            setStatus("Slack connection restored.")
             selectDefaultHold()
         } catch {
             isConnected = false
-            statusMessage = "Slack must be reconnected. Local evidence remains available."
+            ThreadLightLog.session.error(
+                "slack session restore failed: \(ThreadLightLog.category(of: error), privacy: .public)"
+            )
+            setStatus("Slack must be reconnected. Local evidence remains available.")
         }
     }
 
@@ -327,6 +337,9 @@ final class AppModel {
 
     func selectHold(id: String) {
         guard let hold = holds.first(where: { $0.id == id }) else { return }
+        if selectedHold?.id != id {
+            cancelPackaging(reason: "the selected legal hold changed")
+        }
         selectedHold = hold
         selectedMessage = nil
         threadMessages = []
@@ -510,20 +523,35 @@ final class AppModel {
     }
 
     func importHoldArchives(urls: [URL], operatorBinding: String, showReport: Bool = true) async -> Bool {
-        guard let hold = selectedHold, let store, !urls.isEmpty else { return false }
+        guard let hold = selectedHold, let store, !urls.isEmpty else {
+            ThreadLightLog.importer.error(
+                """
+                import refused: hold=\(self.selectedHold != nil, privacy: .public) \
+                store=\(self.store != nil, privacy: .public) archives=\(urls.count, privacy: .public)
+                """
+            )
+            if !urls.isEmpty {
+                show(ThreadLightError.scope("Select an active legal hold before importing Slack export ZIPs."))
+            }
+            return false
+        }
         importProgress = nil
         defer { importProgress = nil }
         var imported = 0
         var messageCount = 0
         var warningCount = 0
+        ThreadLightLog.importer.notice("import started: archives=\(urls.count, privacy: .public)")
         do {
             let importer = SlackExportImporter(store: store) { [weak self] progress in
                 await MainActor.run { self?.importProgress = progress }
             }
-            for url in urls {
+            for (index, url) in urls.enumerated() {
                 try Task.checkCancellation()
                 let access = url.startAccessingSecurityScopedResource()
                 defer { if access { url.stopAccessingSecurityScopedResource() } }
+                ThreadLightLog.importer.info(
+                    "archive \(index + 1, privacy: .public)/\(urls.count, privacy: .public) started, scoped=\(access, privacy: .public)"
+                )
                 let report = try await importer.importHoldArchive(
                     url: url,
                     hold: hold,
@@ -533,6 +561,15 @@ final class AppModel {
                 messageCount += report.messagesImported
                 warningCount += report.warnings.count
                 lastImportReport = report
+                ThreadLightLog.importer.info(
+                    """
+                    archive \(index + 1, privacy: .public)/\(urls.count, privacy: .public) done: \
+                    messages=\(report.messagesImported, privacy: .public) \
+                    deduplicated=\(report.messagesDeduplicated, privacy: .public) \
+                    files=\(report.filesReferenced, privacy: .public) \
+                    warnings=\(report.warnings.count, privacy: .public)
+                    """
+                )
             }
             isShowingImportReport = showReport
             hasImportedPackage = imported > 0
@@ -542,18 +579,98 @@ final class AppModel {
             touchActivity()
             await loadConversations(for: hold)
             await search()
+            ThreadLightLog.importer.notice(
+                """
+                import finished: archives=\(imported, privacy: .public) \
+                messages=\(messageCount, privacy: .public) warnings=\(warningCount, privacy: .public)
+                """
+            )
             return true
         } catch is CancellationError {
+            ThreadLightLog.importer.error(
+                "import cancelled after \(imported, privacy: .public)/\(urls.count, privacy: .public) archives"
+            )
             statusMessage = "Import stopped. Completed ZIP files remain available; an interrupted ZIP can be resumed."
             return false
         } catch {
+            ThreadLightLog.importer.error(
+                """
+                import failed after \(imported, privacy: .public)/\(urls.count, privacy: .public) archives: \
+                \(ThreadLightLog.category(of: error), privacy: .public)
+                """
+            )
             show(error)
             return false
         }
     }
 
+    /// Imports the staged ZIPs and writes the encrypted package as one user-visible operation.
+    /// Every exit path logs and leaves a status message; none of them can end in a stopped
+    /// spinner with nothing said.
+    func savePackage(archives: [URL], operatorBinding: String) {
+        guard !isPackaging else { return }
+        guard !archives.isEmpty else {
+            show(ThreadLightError.export("Attach at least one Slack export ZIP before saving a package."))
+            return
+        }
+        guard let destination = chooseHoldTransferDestination() else { return }
+        isPackaging = true
+        ThreadLightLog.transfer.notice("packaging started: archives=\(archives.count, privacy: .public)")
+        packageTask = Task {
+            defer {
+                self.isPackaging = false
+                self.packageTask = nil
+            }
+            let imported = await self.importHoldArchives(
+                urls: archives,
+                operatorBinding: operatorBinding,
+                showReport: false
+            )
+            guard imported else {
+                // importHoldArchives already logged the cause and set an error or status.
+                ThreadLightLog.transfer.error("packaging stopped: the import did not complete")
+                return
+            }
+            guard !Task.isCancelled else {
+                ThreadLightLog.transfer.error("packaging cancelled between import and export")
+                self.statusMessage = "Packaging stopped before the encrypted package was written. The imported ZIPs are still listed."
+                return
+            }
+            if await self.exportHoldTransfer(to: destination) {
+                self.completedPackageCount += 1
+            }
+        }
+    }
+
+    /// Cancels packaging when the work it depends on is about to be replaced. Silent
+    /// cancellation is what made this failure invisible, so it always reports.
+    private func cancelPackaging(reason: String) {
+        guard isPackaging, let packageTask else { return }
+        ThreadLightLog.transfer.error("packaging cancelled: \(reason, privacy: .public)")
+        packageTask.cancel()
+        self.packageTask = nil
+        isPackaging = false
+        statusMessage = "Packaging stopped because \(reason). No encrypted package was written."
+    }
+
+    /// Background status text that must never overwrite the outcome of an operation the
+    /// user is waiting on. Terminal import/export messages assign `statusMessage` directly.
+    private func setStatus(_ message: String) {
+        guard !isPackaging else {
+            ThreadLightLog.session.info("suppressed background status while packaging")
+            return
+        }
+        statusMessage = message
+    }
+
     func chooseHoldTransferDestination() -> URL? {
-        guard selectedHold?.status == .active else { return nil }
+        guard selectedHold?.status == .active else {
+            ThreadLightLog.transfer.error(
+                "destination refused: hold=\(self.selectedHold != nil, privacy: .public) active=false"
+            )
+            show(ThreadLightError.scope("Select an active legal hold before creating an encrypted package."))
+            return nil
+        }
         let panel = NSSavePanel()
         panel.title = "Save the encrypted legal hold package"
         panel.nameFieldStringValue = "ThreadLight-Hold-\(selectedHold?.name.fileSafePrefix ?? "Export").threadlight-hold"
@@ -604,10 +721,29 @@ final class AppModel {
     }
 
     func exportHoldTransfer(to destination: URL) async -> Bool {
-        guard let hold = selectedHold, let store, let legalHoldClient else { return false }
-        guard let passphrase = promptForExportPassphrase() else { return false }
+        guard let hold = selectedHold, let store, let legalHoldClient else {
+            ThreadLightLog.transfer.error(
+                """
+                export refused: hold=\(self.selectedHold != nil, privacy: .public) \
+                store=\(self.store != nil, privacy: .public) slack=\(self.legalHoldClient != nil, privacy: .public)
+                """
+            )
+            show(ThreadLightError.authentication(
+                "ThreadLight lost its Slack connection before it could build the package. The imported ZIPs are still here — reconnect to Slack and choose Save encrypted package again."
+            ))
+            return false
+        }
+        ThreadLightLog.transfer.notice("export started")
+        guard let passphrase = promptForExportPassphrase() else {
+            ThreadLightLog.transfer.notice("export cancelled at the passphrase prompt")
+            statusMessage = "Package cancelled at the passphrase prompt. The imported ZIPs are still listed."
+            return false
+        }
         let access = destination.startAccessingSecurityScopedResource()
         defer { if access { destination.stopAccessingSecurityScopedResource() } }
+        ThreadLightLog.transfer.info(
+            "destination scoped=\(access, privacy: .public) passphrase=\(passphrase != nil, privacy: .public)"
+        )
         do {
             let currentHold = try await legalHoldClient.policy(id: hold.id)
             let currentCustodians = try await legalHoldClient.listCustodians(policyID: hold.id)
@@ -625,8 +761,10 @@ final class AppModel {
                 ? "Created \(destination.lastPathComponent) without a passphrase. Its key is derived from the hold and member IDs, so anyone with Legal Holds or Slack audit-log access can read it. Transfer it through your approved channel."
                 : "Created passphrase-protected package \(destination.lastPathComponent). Send the passphrase separately from the package."
             touchActivity()
+            ThreadLightLog.transfer.notice("export finished")
             return true
         } catch {
+            ThreadLightLog.transfer.error("export failed: \(ThreadLightLog.category(of: error), privacy: .public)")
             show(error)
             return false
         }
@@ -687,9 +825,9 @@ final class AppModel {
                     await search()
                 }
             }
-            statusMessage = invalidated == 0
+            setStatus(invalidated == 0
                 ? "Refreshed \(refreshed.count) legal hold(s) from Slack."
-                : "A legal hold changed in Slack. ThreadLight removed its old local data because the encrypted package is no longer valid. Import a new package for that hold."
+                : "A legal hold changed in Slack. ThreadLight removed its old local data because the encrypted package is no longer valid. Import a new package for that hold.")
         } catch { show(error) }
     }
 
@@ -1273,6 +1411,11 @@ final class AppModel {
             touchActivity()
             return
         }
+        // The store this replaces is the one a running package is writing into.
+        cancelPackaging(reason: "ThreadLight switched to a different organization's local evidence")
+        ThreadLightLog.session.notice(
+            "storage opened: replacing=\(self.activeStorageNamespace != nil, privacy: .public)"
+        )
         holdLoadTask?.cancel()
         threadLoadTask?.cancel()
         store = try await EvidenceStore.openDefault(organizationID: namespace)

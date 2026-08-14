@@ -234,8 +234,6 @@ struct PackagePreparationSettingsView: View {
     @Environment(AppModel.self) private var model
     @State private var archiveURLs: [URL] = []
     @State private var isDropTargeted = false
-    @State private var isPackaging = false
-    @State private var packageTask: Task<Void, Never>?
     @State private var toDate = Date()
     @State private var fromDate = Calendar.current.date(byAdding: .day, value: -30, to: Date()) ?? Date()
     @State private var copiedScript = false
@@ -280,7 +278,7 @@ struct PackagePreparationSettingsView: View {
                                         Text(hold.name).tag(hold.id)
                                     }
                                 }
-                                .disabled(isPackaging)
+                                .disabled(model.isPackaging)
                             }
 
                             setupSection(number: 2, title: "Choose the date range") {
@@ -368,7 +366,7 @@ struct PackagePreparationSettingsView: View {
                                         chooseArchives()
                                     }
                                     .buttonStyle(.bordered)
-                                    .disabled(isPackaging)
+                                    .disabled(model.isPackaging)
                                 }
                                 .frame(maxWidth: .infinity, minHeight: 230)
                                 .background(
@@ -404,7 +402,7 @@ struct PackagePreparationSettingsView: View {
                                                 }
                                                 .labelStyle(.iconOnly)
                                                 .buttonStyle(.plain)
-                                                .disabled(isPackaging)
+                                                .disabled(model.isPackaging)
                                             }
                                             .padding(.horizontal, 12)
                                             .padding(.vertical, 9)
@@ -425,19 +423,19 @@ struct PackagePreparationSettingsView: View {
 
                     HStack(spacing: 12) {
                         Spacer()
-                        if isPackaging {
+                        if model.isPackaging {
                             ProgressView()
                                 .controlSize(.small)
                         }
                         Button {
                             savePackage()
                         } label: {
-                            Label(isPackaging ? "Creating encrypted package…" : "Save encrypted package…", systemImage: "lock.doc")
+                            Label(model.isPackaging ? "Creating encrypted package…" : "Save encrypted package…", systemImage: "lock.doc")
                         }
                         .buttonStyle(.borderedProminent)
                         .tint(ThreadLightTheme.violet)
                         .controlSize(.large)
-                        .disabled(archiveURLs.isEmpty || isPackaging)
+                        .disabled(archiveURLs.isEmpty || model.isPackaging)
                         Spacer()
                     }
                     .padding(16)
@@ -451,10 +449,11 @@ struct PackagePreparationSettingsView: View {
             }
         }
         .onChange(of: model.selectedHold?.id) {
-            packageTask?.cancel()
             archiveURLs.removeAll()
-            isPackaging = false
             copiedScript = false
+        }
+        .onChange(of: model.completedPackageCount) {
+            archiveURLs.removeAll()
         }
         .onChange(of: toDate) {
             if fromDate > toDate { fromDate = toDate }
@@ -465,7 +464,6 @@ struct PackagePreparationSettingsView: View {
             if toDate < fromDate { toDate = fromDate }
             copiedScript = false
         }
-        .onDisappear { packageTask?.cancel() }
     }
 
     private var activeHolds: [LegalHold] {
@@ -523,25 +521,7 @@ struct PackagePreparationSettingsView: View {
     }
 
     private func savePackage() {
-        guard let destination = model.chooseHoldTransferDestination() else { return }
-        let urls = archiveURLs
-        isPackaging = true
-        packageTask = Task {
-            let imported = await model.importHoldArchives(
-                urls: urls,
-                operatorBinding: NSFullUserName(),
-                showReport: false
-            )
-            guard imported, !Task.isCancelled else {
-                isPackaging = false
-                return
-            }
-            let exported = await model.exportHoldTransfer(to: destination)
-            if exported, !Task.isCancelled {
-                archiveURLs.removeAll()
-            }
-            isPackaging = false
-        }
+        model.savePackage(archives: archiveURLs, operatorBinding: NSFullUserName())
     }
 }
 
