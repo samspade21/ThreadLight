@@ -13,14 +13,14 @@ CI runs a `gitleaks` scan on every pull request. It catches credential shapes, n
 ## Build and test
 
 ```bash
-swift build -Xswiftc -DTHREADLIGHT_DEVELOPMENT
+./scripts/build-app.sh --development
 ```
 
 ```bash
 swift test
 ```
 
-`./scripts/build-app.sh` produces a runnable `.app`. Without `CODE_SIGN_IDENTITY` it makes an ad-hoc development build, which stores the evidence database key in a plaintext file beside the database and shows a permanent red banner. That build is for development only — never point it at real evidence.
+The explicit `--development` mode produces an ad-hoc `.app`, stores the evidence database key in a plaintext file beside the database, and shows a compact warning at the bottom of the window. That build is for development only — never point it at real evidence.
 
 ## Changes that need extra care
 

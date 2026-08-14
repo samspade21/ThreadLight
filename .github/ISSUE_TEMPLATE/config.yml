@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability privately
+    url: https://github.com/samspade21/ThreadLight/security/advisories/new
+    about: Never disclose a vulnerability or real evidence in a public issue.
+  - name: Read the security policy
+    url: https://github.com/samspade21/ThreadLight/security/policy
+    about: Review supported releases, known boundaries, and safe reporting rules.

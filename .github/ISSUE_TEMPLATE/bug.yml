@@ -1,0 +1,72 @@
+name: Bug report
+description: Report a reproducible ThreadLight problem using synthetic information only.
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Do not include real Slack messages, exports, attachments, tokens, hold IDs, workspace IDs, custodian details, customer names, or screenshots.** Reproduce the problem with synthetic information.
+        Security vulnerabilities must be [reported privately](https://github.com/samspade21/ThreadLight/security/advisories/new).
+  - type: input
+    id: version
+    attributes:
+      label: ThreadLight version
+      description: Find this in ThreadLight → About ThreadLight.
+      placeholder: 0.3.0
+    validations:
+      required: true
+  - type: input
+    id: macos
+    attributes:
+      label: macOS version and Mac model
+      placeholder: macOS 26.1, Apple M2 Pro
+    validations:
+      required: true
+  - type: dropdown
+    id: build
+    attributes:
+      label: Build type
+      options:
+        - Signed and notarized release
+        - Development build
+        - Unsure
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: What happened?
+      description: Describe the problem without case or customer information.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Synthetic reproduction steps
+      placeholder: |
+        1. Open a synthetic hold package...
+        2. Select...
+        3. Observe...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Sanitized diagnostics
+      description: Optional. Remove all evidence, identifiers, paths, domains, names, and credentials before pasting text. Do not upload evidence files.
+      render: shell
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Safety confirmation
+      options:
+        - label: I confirm this report contains only synthetic information and no confidential, personal, customer, case, evidence, authentication, or signing data.
+          required: true

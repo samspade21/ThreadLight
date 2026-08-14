@@ -1,0 +1,46 @@
+name: Feature request
+description: Suggest an improvement without sharing customer or case information.
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Do not include real Slack messages, exports, attachments, hold IDs, workspace IDs, custodian details, customer names, or screenshots.** Use a synthetic example.
+  - type: dropdown
+    id: audience
+    attributes:
+      label: Who needs this?
+      options:
+        - Lawyer or legal reviewer
+        - Slack administrator
+        - Security or compliance administrator
+        - Developer or contributor
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem to solve
+      description: Describe the workflow problem, not only the desired control.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Suggested behavior
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Current workaround
+      description: Optional. Explain how the task is handled today.
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Safety confirmation
+      options:
+        - label: I confirm this request contains only synthetic information and no confidential, personal, customer, case, evidence, authentication, or signing data.
+          required: true

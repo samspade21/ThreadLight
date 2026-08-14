@@ -18,7 +18,7 @@ jobs:
     # lags that toolchain, point this at a self-hosted runner with a current Xcode.
     runs-on: macos-26
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Show toolchain
         run: swift --version
@@ -32,7 +32,7 @@ jobs:
   secret-scan:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           # gitleaks needs history to scan commits, not just the working tree.
           fetch-depth: 0
@@ -41,8 +41,10 @@ jobs:
         run: |
           set -euo pipefail
           VERSION=8.28.0
+          SHA256=a65b5253807a68ac0cafa4414031fd740aeb55f54fb7e55f386acb52e6a840eb
           curl -sSfL -o gitleaks.tar.gz \
             "https://github.com/gitleaks/gitleaks/releases/download/v${VERSION}/gitleaks_${VERSION}_linux_x64.tar.gz"
+          echo "${SHA256}  gitleaks.tar.gz" | sha256sum --check --strict
           tar -xzf gitleaks.tar.gz gitleaks
           sudo install -m 0755 gitleaks /usr/local/bin/gitleaks
 

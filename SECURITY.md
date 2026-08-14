@@ -2,9 +2,9 @@
 
 ## Reporting
 
-Private vulnerability reporting is not enabled on this repository. Report security issues by opening a public issue, or by opening a pull request with a fix.
+Report security issues through [GitHub private vulnerability reporting](https://github.com/samspade21/ThreadLight/security/advisories/new). Do not open a public issue or pull request for an undisclosed vulnerability.
 
-Because reports are public from the moment you file them, **never attach or paste real data**. That means no Slack exports, OAuth tokens, evidence databases, signatures containing case metadata, custodian names or member IDs, or customer screenshots. Reproduce with synthetic fixtures — `Tests/ThreadLightCoreTests` shows the shape they take.
+Even in a private report, **never attach or paste real data**. That means no Slack exports, OAuth tokens, evidence databases, signatures containing case metadata, custodian names or member IDs, or customer screenshots. Reproduce with synthetic fixtures — `Tests/ThreadLightCoreTests` shows the shape they take.
 
 A good report names the affected file and line, states what an attacker gains, and gives the steps to reproduce.
 
@@ -26,6 +26,6 @@ Known and documented limitations are in [docs/THREAT_MODEL.md](docs/THREAT_MODEL
 
 The latest signed release only.
 
-Ad-hoc and debug builds store the evidence database key in a plaintext file beside the database. They display a permanent banner saying so and must never hold real evidence. Issues that depend on a development build having weak key storage are working as documented, not vulnerabilities.
+Ad-hoc and debug builds store the evidence database key in a plaintext file beside the database. They display a compact warning at the bottom of the window and must never hold real evidence. Issues that depend on a development build having weak key storage are working as documented, not vulnerabilities.
 
 Production use requires human review of the database schema, Slack app configuration, dependency audit, and evidence policy.
