@@ -1176,8 +1176,16 @@ final class AppModel {
             sidebarSelection = .setup
             setup.update(.custodianExports, state: .pending)
             setup.update(.attachments, state: .pending)
-            statusMessage = "Purged local evidence from \(namespaces.count) organization profile(s)."
             touchActivity()
+            ThreadLightLog.session.notice(
+                "purged local evidence from \(namespaces.count, privacy: .public) profile(s)"
+            )
+            // Legal holds belong to Slack, not to local evidence. Purging drops the cached hold
+            // and custodian rows along with the messages, so they have to be read back from
+            // Slack. Without this the sign-in is still valid but every hold list is empty,
+            // which reads as being signed out.
+            await refreshLegalHolds()
+            statusMessage = "Purged local evidence from \(namespaces.count) organization profile(s). Slack sign-in and legal holds are unchanged."
         } catch { show(error) }
     }
 
