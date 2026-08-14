@@ -13,6 +13,10 @@ public final class SetupCoordinator {
     public private(set) var activeRequest: SetupHandoffPackage?
     public private(set) var legalRequesterSignerKeyID: String?
     public private(set) var administratorSignerKeyID: String?
+    /// The administrator signer key ID the operator confirmed out of band. A handoff package
+    /// carries its own verifying public key, so its signature proves only internal consistency —
+    /// this comparison is what actually ties the imported client ID to a known sender.
+    public private(set) var confirmedAdministratorSignerKeyID: String?
     public private(set) var expectedOrganizationID: String?
     public private(set) var unmatchedAdministratorCompletionImported: Bool
     public private(set) var isManagedConfiguration: Bool
@@ -36,6 +40,7 @@ public final class SetupCoordinator {
             activeRequest = state.activeRequest
             legalRequesterSignerKeyID = state.legalRequesterSignerKeyID
             administratorSignerKeyID = state.administratorSignerKeyID
+            confirmedAdministratorSignerKeyID = state.confirmedAdministratorSignerKeyID
             expectedOrganizationID = state.expectedOrganizationID
             unmatchedAdministratorCompletionImported = state.unmatchedAdministratorCompletionImported ?? false
         } else {
@@ -47,6 +52,7 @@ public final class SetupCoordinator {
             activeRequest = nil
             legalRequesterSignerKeyID = nil
             administratorSignerKeyID = nil
+            confirmedAdministratorSignerKeyID = nil
             expectedOrganizationID = nil
             unmatchedAdministratorCompletionImported = false
         }
@@ -72,6 +78,21 @@ public final class SetupCoordinator {
             }
     }
 
+    /// True when a client ID arrived from a signed handoff package whose signer the operator
+    /// has not yet confirmed. MDM-managed installs are exempt: their client ID comes from the
+    /// configuration profile, not from a package that could have been altered in transit.
+    public var requiresAdministratorSignerConfirmation: Bool {
+        guard !isManagedConfiguration, let administratorSignerKeyID else { return false }
+        return administratorSignerKeyID != confirmedAdministratorSignerKeyID
+    }
+
+    public func confirmAdministratorSignerKeyID() {
+        guard let administratorSignerKeyID else { return }
+        confirmedAdministratorSignerKeyID = administratorSignerKeyID
+        lastValidationMessage = "Signer \(administratorSignerKeyID.prefix(12))… confirmed. You can now sign in to Slack."
+        save()
+    }
+
     public func update(_ id: SetupRequirementID, state: SetupRequirementState, message: String? = nil) {
         guard let index = requirements.firstIndex(where: { $0.id == id }) else { return }
         requirements[index].state = state
@@ -90,6 +111,7 @@ public final class SetupCoordinator {
                 activeRequest: activeRequest,
                 legalRequesterSignerKeyID: legalRequesterSignerKeyID,
                 administratorSignerKeyID: administratorSignerKeyID,
+                confirmedAdministratorSignerKeyID: confirmedAdministratorSignerKeyID,
                 expectedOrganizationID: expectedOrganizationID,
                 unmatchedAdministratorCompletionImported: unmatchedAdministratorCompletionImported
             )
@@ -106,6 +128,7 @@ public final class SetupCoordinator {
         activeRequest = nil
         legalRequesterSignerKeyID = nil
         administratorSignerKeyID = nil
+        confirmedAdministratorSignerKeyID = nil
         expectedOrganizationID = nil
         unmatchedAdministratorCompletionImported = false
         applyManagedConfiguration()
@@ -119,6 +142,7 @@ public final class SetupCoordinator {
         }
         slackClientID = ""
         administratorSignerKeyID = nil
+        confirmedAdministratorSignerKeyID = nil
         expectedOrganizationID = nil
         lastValidationMessage = "Starting with a new Slack app. Organization and export-access details were preserved."
         save()
@@ -307,6 +331,8 @@ public final class SetupCoordinator {
         organizationDomain = package.enterpriseDomain
         slackClientID = package.clientID
         administratorSignerKeyID = signerKeyID
+        // A new package means a new signer to confirm, even if one was confirmed before.
+        confirmedAdministratorSignerKeyID = nil
         expectedOrganizationID = nil
         for id in SetupRequirementID.administratorRequirements {
             update(id, state: .ready)
@@ -475,6 +501,7 @@ public struct SetupState: Codable, Sendable {
     public var activeRequest: SetupHandoffPackage?
     public var legalRequesterSignerKeyID: String?
     public var administratorSignerKeyID: String?
+    public var confirmedAdministratorSignerKeyID: String?
     public var expectedOrganizationID: String?
     public var unmatchedAdministratorCompletionImported: Bool?
 }

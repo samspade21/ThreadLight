@@ -218,6 +218,11 @@ final class AppModel {
 
     func beginSlackSignIn() {
         do {
+            guard !setup.requiresAdministratorSignerConfirmation else {
+                throw ThreadLightError.invalidConfiguration(
+                    "Confirm the Slack Admin handoff signer before signing in. The handoff carries its own verifying key, so its signature alone does not prove who sent it — compare the full signer ID with the Slack Admin through your approved channel, then confirm it in setup."
+                )
+            }
             setup.save()
             let attempt = try OAuthAttempt.make(clientID: setup.slackClientID)
             pendingSignIn = attempt
@@ -560,8 +565,47 @@ final class AppModel {
         return panel.url
     }
 
+    /// Without a passphrase the package key comes only from the hold and member IDs, which
+    /// anyone with Legal Holds or Slack audit-log access can read. Offer the passphrase first.
+    private func promptForExportPassphrase() -> String?? {
+        let alert = NSAlert()
+        alert.messageText = "Protect this package with a passphrase?"
+        alert.informativeText = """
+        Without a passphrase, the package is encrypted with a key derived from the hold and member IDs alone. \
+        Anyone with Legal Holds access or Slack audit-log access can rebuild that key and read the package.
+
+        Share the passphrase with the recipient through a channel separate from the package itself.
+        """
+        let field = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 280, height: 24))
+        field.placeholderString = "At least 12 characters"
+        alert.accessoryView = field
+        alert.addButton(withTitle: "Use passphrase")
+        alert.addButton(withTitle: "Export without passphrase")
+        alert.addButton(withTitle: "Cancel")
+        alert.window.initialFirstResponder = field
+        switch alert.runModal() {
+        case .alertFirstButtonReturn: return .some(field.stringValue)
+        case .alertSecondButtonReturn: return .some(nil)
+        default: return nil
+        }
+    }
+
+    private func promptForImportPassphrase() -> String? {
+        let alert = NSAlert()
+        alert.messageText = "This package needs its passphrase"
+        alert.informativeText = "Enter the passphrase the sender shared through the approved channel."
+        let field = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 280, height: 24))
+        alert.accessoryView = field
+        alert.addButton(withTitle: "Import")
+        alert.addButton(withTitle: "Cancel")
+        alert.window.initialFirstResponder = field
+        guard alert.runModal() == .alertFirstButtonReturn else { return nil }
+        return field.stringValue
+    }
+
     func exportHoldTransfer(to destination: URL) async -> Bool {
         guard let hold = selectedHold, let store, let legalHoldClient else { return false }
+        guard let passphrase = promptForExportPassphrase() else { return false }
         let access = destination.startAccessingSecurityScopedResource()
         defer { if access { destination.stopAccessingSecurityScopedResource() } }
         do {
@@ -574,9 +618,12 @@ final class AppModel {
             _ = try await HoldTransferService(store: store).export(
                 hold: currentHold,
                 custodians: currentCustodians,
-                destination: destination
+                destination: destination,
+                passphrase: passphrase
             )
-            statusMessage = "Created encrypted package \(destination.lastPathComponent). Transfer it through your approved channel."
+            statusMessage = passphrase == nil
+                ? "Created \(destination.lastPathComponent) without a passphrase. Its key is derived from the hold and member IDs, so anyone with Legal Holds or Slack audit-log access can read it. Transfer it through your approved channel."
+                : "Created passphrase-protected package \(destination.lastPathComponent). Send the passphrase separately from the package."
             touchActivity()
             return true
         } catch {
@@ -590,6 +637,11 @@ final class AppModel {
         let access = url.startAccessingSecurityScopedResource()
         defer { if access { url.stopAccessingSecurityScopedResource() } }
         do {
+            var passphrase: String?
+            if try HoldTransferService.requiresPassphrase(url: url) {
+                guard let entered = promptForImportPassphrase() else { return }
+                passphrase = entered
+            }
             let currentHolds = try await legalHoldClient.listPolicies(status: nil)
             var candidates: [HoldTransferCandidate] = []
             for hold in currentHolds where hold.status == .active {
@@ -599,7 +651,8 @@ final class AppModel {
             }
             let result = try await HoldTransferService(store: store).importTransfer(
                 url: url,
-                candidates: candidates
+                candidates: candidates,
+                passphrase: passphrase
             )
             holds = currentHolds
             sidebarSelection = .hold(result.hold.id)

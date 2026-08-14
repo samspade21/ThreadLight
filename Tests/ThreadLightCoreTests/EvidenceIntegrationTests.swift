@@ -473,6 +473,81 @@ import ZIPFoundation
     }
 }
 
+@Test func passphraseProtectedHoldTransferResistsCorrectHoldIdentifiers() async throws {
+    let source = try StoreFixture()
+    defer { source.cleanup() }
+    try await source.seed()
+    let passphrase = "correct horse battery staple"
+    let transferURL = source.root.appending(path: "protected.threadlight-hold")
+    _ = try await HoldTransferService(store: source.store).export(
+        hold: source.hold,
+        custodians: [source.custodian],
+        destination: transferURL,
+        passphrase: passphrase
+    )
+    #expect(try HoldTransferService.requiresPassphrase(url: transferURL))
+
+    let candidates = [HoldTransferCandidate(hold: source.hold, custodians: [source.custodian])]
+
+    // The whole point: knowing the hold and member IDs is no longer enough.
+    await #expect(throws: ThreadLightError.self) {
+        _ = try await HoldTransferService(store: try EvidenceStore(
+            url: source.root.appending(path: "nopass.sqlite"),
+            key: Data(repeating: 5, count: 32)
+        )).importTransfer(url: transferURL, candidates: candidates)
+    }
+    await #expect(throws: ThreadLightError.self) {
+        _ = try await HoldTransferService(store: try EvidenceStore(
+            url: source.root.appending(path: "wrongpass.sqlite"),
+            key: Data(repeating: 6, count: 32)
+        )).importTransfer(url: transferURL, candidates: candidates, passphrase: "wrong passphrase entirely")
+    }
+
+    let destination = try EvidenceStore(
+        url: source.root.appending(path: "legal.sqlite"),
+        key: Data(repeating: 8, count: 32)
+    )
+    let result = try await HoldTransferService(store: destination).importTransfer(
+        url: transferURL,
+        candidates: candidates,
+        passphrase: passphrase
+    )
+    #expect(result.hold.id == source.hold.id)
+    #expect(try await destination.search(holdID: source.hold.id, query: .init(text: "approval")).count == 1)
+}
+
+@Test func holdTransferRejectsShortPassphraseAndMismatchedProtectionMode() async throws {
+    let source = try StoreFixture()
+    defer { source.cleanup() }
+    try await source.seed()
+    let service = HoldTransferService(store: source.store)
+
+    await #expect(throws: ThreadLightError.self) {
+        _ = try await service.export(
+            hold: source.hold,
+            custodians: [source.custodian],
+            destination: source.root.appending(path: "short.threadlight-hold"),
+            passphrase: "tooshort"
+        )
+    }
+
+    let openURL = source.root.appending(path: "open.threadlight-hold")
+    _ = try await service.export(hold: source.hold, custodians: [source.custodian], destination: openURL)
+    #expect(try HoldTransferService.requiresPassphrase(url: openURL) == false)
+
+    // Supplying a passphrase for an unprotected package is a mistake worth naming, not ignoring.
+    await #expect(throws: ThreadLightError.self) {
+        _ = try await HoldTransferService(store: try EvidenceStore(
+            url: source.root.appending(path: "surprise.sqlite"),
+            key: Data(repeating: 9, count: 32)
+        )).importTransfer(
+            url: openURL,
+            candidates: [.init(hold: source.hold, custodians: [source.custodian])],
+            passphrase: "unexpected passphrase"
+        )
+    }
+}
+
 @Test func changedHoldMembershipPurgesLocalEvidence() async throws {
     let fixture = try StoreFixture()
     defer { fixture.cleanup() }

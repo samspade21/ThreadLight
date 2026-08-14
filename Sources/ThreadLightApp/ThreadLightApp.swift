@@ -57,6 +57,33 @@ private struct WorkspaceWindow: View {
             .environment(model)
             .focusedSceneValue(\.threadLightModel, model)
             .frame(minWidth: 1_200, minHeight: 700)
+            .safeAreaInset(edge: .top, spacing: 0) { DevelopmentBuildBanner() }
+    }
+}
+
+/// Debug and ad-hoc builds keep the evidence database key and the resource-vault key in
+/// plaintext files under Application Support instead of the Keychain, so the encrypted
+/// store offers no protection at rest. Production Developer ID builds compile this out.
+struct DevelopmentBuildBanner: View {
+    var body: some View {
+        #if THREADLIGHT_DEVELOPMENT
+        HStack(spacing: 8) {
+            Image(systemName: "exclamationmark.triangle.fill")
+            Text("Development build — the evidence database key is stored unencrypted on disk. Not for real evidence.")
+                .fontWeight(.semibold)
+            Spacer(minLength: 0)
+        }
+        .font(.callout)
+        .padding(.horizontal, 16)
+        .padding(.vertical, 8)
+        .frame(maxWidth: .infinity)
+        .background(.red)
+        .foregroundStyle(.white)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Development build. The evidence database key is stored unencrypted on disk. Not for real evidence.")
+        #else
+        EmptyView()
+        #endif
     }
 }
 

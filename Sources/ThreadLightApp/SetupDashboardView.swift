@@ -84,6 +84,12 @@ struct SlackAppInstallationSettingsView: View {
                         Instruction(number: 3, text: "Choose Install to Organization and select your organization.")
                         Instruction(number: 4, text: "Return here and sign in once to confirm ThreadLight can read the legal hold list.")
 
+                        if setup.requiresAdministratorSignerConfirmation, let signer = setup.administratorSignerKeyID {
+                            SignerConfirmation(signerKeyID: signer) {
+                                setup.confirmAdministratorSignerKeyID()
+                            }
+                        }
+
                         HStack {
                             Link("Open Slack apps", destination: SlackAppManifest.createAppURL)
                             Button {
@@ -93,7 +99,13 @@ struct SlackAppInstallationSettingsView: View {
                             }
                             .buttonStyle(.borderedProminent)
                             .tint(ThreadLightTheme.violet)
-                            .disabled(!hasAppDetails || isConnecting || model.isConnected || model.pendingSignIn != nil)
+                            .disabled(
+                                !hasAppDetails
+                                    || isConnecting
+                                    || model.isConnected
+                                    || model.pendingSignIn != nil
+                                    || setup.requiresAdministratorSignerConfirmation
+                            )
                         }
 
                         if model.pendingSignIn != nil, !model.isConnected {
@@ -530,6 +542,42 @@ struct PackagePreparationSettingsView: View {
             }
             isPackaging = false
         }
+    }
+}
+
+/// A handoff package carries the public key that verifies its own signature, so a valid
+/// signature only proves the package is internally consistent — anyone who alters it can
+/// re-sign with their own key. Comparing this ID out of band is what ties the imported
+/// client ID to the real Slack Admin, so sign-in stays blocked until that happens.
+private struct SignerConfirmation: View {
+    let signerKeyID: String
+    let confirm: () -> Void
+    @State private var isConfirmed = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Label("Confirm who sent this handoff", systemImage: "exclamationmark.shield.fill")
+                .font(.headline)
+            Text("The signature on this handoff proves only that its contents are unaltered against the key inside it. Read the full signer ID below to the Slack Admin through your approved channel and confirm it matches theirs. Until then ThreadLight will not sign in with the client ID this handoff supplied.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+            Text(signerKeyID)
+                .font(.system(.caption, design: .monospaced))
+                .textSelection(.enabled)
+                .padding(8)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(.quaternary, in: RoundedRectangle(cornerRadius: 6))
+            Toggle("I compared this signer ID with the Slack Admin out of band and it matches", isOn: $isConfirmed)
+                .font(.callout)
+            Button("Confirm signer") { confirm() }
+                .buttonStyle(.borderedProminent)
+                .tint(ThreadLightTheme.violet)
+                .disabled(!isConfirmed)
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(.yellow.opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
+        .overlay(RoundedRectangle(cornerRadius: 8).stroke(.yellow, lineWidth: 1))
     }
 }
 

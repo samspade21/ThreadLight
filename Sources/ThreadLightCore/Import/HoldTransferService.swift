@@ -64,6 +64,22 @@ public struct HoldTransferService: Sendable {
         return destination
     }
 
+    /// Reads only the package header so the app can ask for a passphrase before it imports.
+    public static func requiresPassphrase(url: URL) throws -> Bool {
+        let handle = try FileHandle(forReadingFrom: url)
+        defer { try? handle.close() }
+        guard let header = try handle.read(upToCount: magic.count + 1), header.count == magic.count + 1 else {
+            throw ThreadLightError.archive("This is not a supported ThreadLight hold transfer.")
+        }
+        guard header.starts(with: magic) else {
+            if header.starts(with: legacyMagic) {
+                throw ThreadLightError.archive("This hold transfer was created by an older ThreadLight build. Ask the sender to create a new package.")
+            }
+            throw ThreadLightError.archive("This is not a supported ThreadLight hold transfer.")
+        }
+        return header[header.startIndex + magic.count] == 1
+    }
+
     public func importTransfer(
         url: URL,
         candidates: [HoldTransferCandidate],

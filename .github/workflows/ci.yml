@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    # ThreadLight targets macOS 26 and swift-tools-version 6.3. If the hosted image
+    # lags that toolchain, point this at a self-hosted runner with a current Xcode.
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: swift --version
+
+      - name: Build
+        run: swift build --configuration debug -Xswiftc -DTHREADLIGHT_DEVELOPMENT
+
+      - name: Test
+        run: swift test --configuration debug
+
+  secret-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # gitleaks needs history to scan commits, not just the working tree.
+          fetch-depth: 0
+
+      - name: Install gitleaks
+        run: |
+          set -euo pipefail
+          VERSION=8.28.0
+          curl -sSfL -o gitleaks.tar.gz \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${VERSION}/gitleaks_${VERSION}_linux_x64.tar.gz"
+          tar -xzf gitleaks.tar.gz gitleaks
+          sudo install -m 0755 gitleaks /usr/local/bin/gitleaks
+
+      - name: Scan for secrets
+        run: gitleaks detect --no-banner --redact --verbose
