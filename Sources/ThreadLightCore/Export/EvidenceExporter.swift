@@ -90,7 +90,7 @@ public struct EvidenceExporter: Sendable {
             var payloadURLs = [readmeURL]
             if formats.contains(.json) {
                 let jsonURL = packageURL.appending(path: "evidence.json")
-                let evidence = EvidenceDocument(schemaVersion: 1, hold: hold, messages: messages)
+                let evidence = EvidenceDocument(schemaVersion: 1, hold: hold, messages: try await hydratedRawJSON(messages))
                 try CanonicalJSON.encode(evidence).write(to: jsonURL, options: [.atomic, .completeFileProtection])
                 payloadURLs.append(jsonURL)
             }
@@ -191,7 +191,7 @@ public struct EvidenceExporter: Sendable {
             for (format, url) in targets {
                 switch format {
                 case .json:
-                    let evidence = EvidenceDocument(schemaVersion: 1, hold: hold, messages: messages)
+                    let evidence = EvidenceDocument(schemaVersion: 1, hold: hold, messages: try await hydratedRawJSON(messages))
                     let data = try CanonicalJSON.encode(evidence)
                     try data.write(to: url, options: [.atomic, .completeFileProtection])
                     written.append(url)
@@ -270,7 +270,7 @@ public struct EvidenceExporter: Sendable {
 
         let temporary = FileManager.default.temporaryDirectory.appending(path: "ThreadLight-\(UUID().uuidString).json")
         do {
-            let evidence = EvidenceDocument(schemaVersion: 1, hold: hold, messages: messages)
+            let evidence = EvidenceDocument(schemaVersion: 1, hold: hold, messages: try await hydratedRawJSON(messages))
             let data = try CanonicalJSON.encode(evidence)
             try data.write(to: temporary, options: [.atomic, .completeFileProtection])
             let decoded = try CanonicalJSON.decoder.decode(EvidenceDocument.self, from: Data(contentsOf: temporary))
@@ -286,6 +286,18 @@ public struct EvidenceExporter: Sendable {
         } catch {
             try? FileManager.default.removeItem(at: temporary)
             throw error
+        }
+    }
+
+    /// Search and thread reads return messages without their raw source JSON; the JSON
+    /// evidence document is where those bytes must be produced, so they are loaded here.
+    private func hydratedRawJSON(_ messages: [EvidenceMessage]) async throws -> [EvidenceMessage] {
+        let raw = try await store.rawJSON(messageIDs: messages.map(\.id))
+        return messages.map { message in
+            guard message.rawJSON.isEmpty, let bytes = raw[message.id], !bytes.isEmpty else { return message }
+            var hydrated = message
+            hydrated.rawJSON = bytes
+            return hydrated
         }
     }
 
@@ -309,13 +321,26 @@ public struct EvidenceExporter: Sendable {
         var items: [EvidenceManifest.Item] = []
         var sources: [UUID: SourceArchive] = [:]
         var warnings: [String] = []
+        // A hold references at most a few hundred archives; the messages reference them tens
+        // of thousands of times, so both lookups are cached outside the message loop.
+        var archivesByID: [UUID: SourceArchive?] = [:]
+        let custodiansByID = Dictionary(
+            custodians.filter { $0.holdID == hold.id }.map { ($0.id, $0) },
+            uniquingKeysWith: { first, _ in first }
+        )
         for message in messages {
             let memberships = try await store.memberships(messageID: message.id, holdID: hold.id)
             var accepted: [(HoldMembership, SourceArchive)] = []
             var lastBlocked: ScopeDecision?
             for membership in memberships {
-                let archive = try await store.sourceArchive(id: membership.sourceArchiveID)
-                let custodian = custodians.first { $0.id == membership.custodianID && $0.holdID == hold.id }
+                let archive: SourceArchive?
+                if let cached = archivesByID[membership.sourceArchiveID] {
+                    archive = cached
+                } else {
+                    archive = try await store.sourceArchive(id: membership.sourceArchiveID)
+                    archivesByID[membership.sourceArchiveID] = archive
+                }
+                let custodian = custodiansByID[membership.custodianID]
                 let decision = ScopeEvaluator.evaluate(message: message, hold: hold, custodian: custodian, archive: archive, membership: membership)
                 if decision.canExport, let archive { accepted.append((membership, archive)) }
                 else { lastBlocked = decision }
@@ -334,17 +359,17 @@ public struct EvidenceExporter: Sendable {
                 }
                 throw ThreadLightError.scope("Message \(message.id) has conflicting source records.")
             }
-            let fallbackRaw = message.rawJSON.isEmpty ? try CanonicalJSON.encode(message) : message.rawJSON
             for relation in accepted {
+                guard !relation.0.sourceMessageSHA256.isEmpty else {
+                    throw ThreadLightError.scope("Message \(message.id) has no stored source hash. Re-import the untouched source ZIP.")
+                }
                 sources[relation.1.id] = relation.1
                 items.append(.init(
                     messageID: message.id,
                     conversationID: message.conversationID,
                     threadID: message.threadID,
                     postedAt: message.postedAt,
-                    sha256: relation.0.sourceMessageSHA256.isEmpty
-                        ? SHA256Digest.data(fallbackRaw)
-                        : relation.0.sourceMessageSHA256,
+                    sha256: relation.0.sourceMessageSHA256,
                     sourceArchiveID: relation.0.sourceArchiveID,
                     custodianID: relation.0.custodianID
                 ))
@@ -569,7 +594,7 @@ enum PDFRenderer {
     private static let ruleInk = NSColor(calibratedWhite: 0.82, alpha: 1)
 
     private struct Page {
-        let content: NSAttributedString
+        let framesetter: CTFramesetter
         let range: CFRange
     }
 
@@ -597,7 +622,7 @@ enum PDFRenderer {
                     context.closePDF()
                     throw ThreadLightError.export("A PDF page could not fit the selected evidence text.")
                 }
-                pages.append(.init(content: content, range: visible))
+                pages.append(.init(framesetter: framesetter, range: visible))
                 location += visible.length
             }
         }
@@ -606,8 +631,7 @@ enum PDFRenderer {
             context.beginPDFPage(nil)
             context.setFillColor(pageColor.cgColor)
             context.fill(mediaBox)
-            let framesetter = CTFramesetterCreateWithAttributedString(page.content)
-            let frame = CTFramesetterCreateFrame(framesetter, page.range, CGPath(rect: contentRect, transform: nil), nil)
+            let frame = CTFramesetterCreateFrame(page.framesetter, page.range, CGPath(rect: contentRect, transform: nil), nil)
             CTFrameDraw(frame, context)
             context.setStrokeColor(ruleInk.cgColor)
             context.setLineWidth(0.5)

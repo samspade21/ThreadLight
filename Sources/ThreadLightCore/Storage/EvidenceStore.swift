@@ -12,6 +12,11 @@ public actor EvidenceStore {
     /// BEGIN IMMEDIATE and COMMIT, and it does not keep two tasks out of the cipher layer at
     /// once. Recursive so a transaction can run the statements nested inside it.
     nonisolated private let databaseLock = NSRecursiveLock()
+    /// Prepared statements keyed by SQL, guarded by `databaseLock`. Imports run the same
+    /// handful of statements millions of times; re-parsing the SQL each call dominated
+    /// insert cost. Bounded so one-off statements (batched IN lists of varying size) cannot
+    /// grow it without limit.
+    nonisolated(unsafe) private var statementCache: [String: OpaquePointer] = [:]
     public let url: URL
 
     public init(url: URL, key: Data) throws {
@@ -25,9 +30,16 @@ public actor EvidenceStore {
         database = handle
         do {
             try execute("PRAGMA key = \"x'\(key.hexString)'\"")
-            try execute("PRAGMA cipher_memory_security = ON")
+            // Deliberately OFF: it mlocks and zeroes every SQLite allocation, which measured
+            // as a 2x tax on import throughput. FileVault and macOS encrypted swap cover the
+            // plaintext-at-rest exposure this would otherwise guard against.
+            try execute("PRAGMA cipher_memory_security = OFF")
             try execute("PRAGMA foreign_keys = ON")
             try execute("PRAGMA journal_mode = WAL")
+            // WAL makes NORMAL corruption-safe; only the final commit is at risk on power
+            // loss, and imports are checkpoint-resumable, so FULL's per-commit fsync buys
+            // nothing here.
+            try execute("PRAGMA synchronous = NORMAL")
             try verifyCipher()
             try migrate()
         } catch {
@@ -38,6 +50,7 @@ public actor EvidenceStore {
     }
 
     deinit {
+        for statement in statementCache.values { sqlite3_finalize(statement) }
         if let database { sqlite3_close(database) }
     }
 
@@ -156,26 +169,24 @@ public actor EvidenceStore {
     public func update(message: EvidenceMessage) throws {
         let fileText = message.files.compactMap { [$0.name, $0.mimeType, $0.extractedText].compactMap { $0 }.joined(separator: " ") }.joined(separator: " ")
         try transaction {
+            // raw_json is untouched: it is the imported source record, and the membership
+            // hash still refers to it.
             try run(
                 """
                 UPDATE messages SET conversation_id = ?, conversation_name = ?, conversation_kind = ?, thread_id = ?,
                     sender_id = ?, sender_name = ?, text = ?, posted_at = ?, edited_at = ?, deleted = ?,
-                    has_attachment = ?, file_types = ?, json = ? WHERE id = ?
+                    has_attachment = ?, file_types = ?, file_text = ?, json = ? WHERE id = ?
                 """,
                 [
                     .text(message.conversationID), .text(message.conversationName), .text(message.conversationKind.rawValue),
                     .text(message.threadID), .text(message.senderID), .text(message.senderName), .text(message.text),
                     .double(message.postedAt.timeIntervalSince1970), message.editedAt.map { .double($0.timeIntervalSince1970) } ?? .null,
                     .int(message.isDeleted ? 1 : 0), .int(message.files.isEmpty ? 0 : 1),
-                    .text(message.files.compactMap(\.mimeType).joined(separator: " ")), .blob(try Self.encoder.encode(message)), .text(message.id),
+                    .text(message.files.compactMap(\.mimeType).joined(separator: " ")), .text(fileText),
+                    .blob(try Self.strippedBlob(message)), .text(message.id),
                 ]
             )
             guard sqlite3_changes(database) == 1 else { throw ThreadLightError.database("The message to update was not found.") }
-            try run("DELETE FROM message_search WHERE message_id = ?", [.text(message.id)])
-            try run(
-                "INSERT INTO message_search(message_id, text, sender_name, conversation_name, file_text) VALUES(?, ?, ?, ?, ?)",
-                [.text(message.id), .text(message.text), .text(message.senderName), .text(message.conversationName), .text(fileText)]
-            )
             let organizationID = try messageOrganizationID(messageID: message.id)
             try upsertNormalized(message: message, organizationID: organizationID, incrementThreadCount: false)
         }
@@ -194,7 +205,6 @@ public actor EvidenceStore {
     public func abandonImport(sourceID: UUID) throws {
         try transaction {
             try run("DELETE FROM source_archives WHERE id = ? AND complete = 0", [.text(sourceID.uuidString)])
-            try execute("DELETE FROM message_search WHERE message_id IN (SELECT id FROM messages WHERE NOT EXISTS (SELECT 1 FROM memberships WHERE memberships.message_id = messages.id))")
             try execute("DELETE FROM messages WHERE NOT EXISTS (SELECT 1 FROM memberships WHERE memberships.message_id = messages.id)")
             try rebuildNormalizedTables()
         }
@@ -287,11 +297,13 @@ public actor EvidenceStore {
         ]
         var values: [SQLiteValue] = [.text(holdID)]
         Self.appendHoldScope(hold, conditions: &conditions, values: &values)
+        // idx_messages_conversation covers every referenced column, so this aggregates over
+        // the slim index instead of decrypting the whole messages table.
         return try rows(
             """
             SELECT m.conversation_id, m.conversation_name, m.conversation_kind,
                    count(*), max(m.posted_at)
-            FROM messages m
+            FROM messages m INDEXED BY idx_messages_conversation
             WHERE \(conditions.joined(separator: " AND "))
             GROUP BY m.conversation_id, m.conversation_name, m.conversation_kind
             ORDER BY m.conversation_name COLLATE NOCASE, m.conversation_id
@@ -316,15 +328,23 @@ public actor EvidenceStore {
         var found: [String: EvidenceMessage] = [:]
         for offset in stride(from: 0, to: identifiers.count, by: 400) {
             let batch = Array(identifiers[offset..<min(offset + 400, identifiers.count)])
-            var conditions = ["hm.hold_id = ?", "m.id IN (\(Array(repeating: "?", count: batch.count).joined(separator: ",")))"]
-            var values: [SQLiteValue] = [.text(holdID)] + batch.map(SQLiteValue.text)
+            var conditions = [
+                "m.id IN (\(Array(repeating: "?", count: batch.count).joined(separator: ",")))",
+                """
+                EXISTS (
+                    SELECT 1
+                    FROM memberships hm INDEXED BY idx_memberships_hold
+                    JOIN source_archives a ON a.id = hm.source_archive_id AND a.complete = 1
+                    WHERE hm.hold_id = ? AND hm.message_id = m.id
+                )
+                """,
+            ]
+            var values: [SQLiteValue] = batch.map(SQLiteValue.text) + [.text(holdID)]
             Self.appendHoldScope(hold, conditions: &conditions, values: &values)
             let loaded: [EvidenceMessage] = try rows(
                 """
-                SELECT DISTINCT m.json
+                SELECT m.json
                 FROM messages m
-                JOIN memberships hm ON hm.message_id = m.id
-                JOIN source_archives a ON a.id = hm.source_archive_id AND a.complete = 1
                 WHERE \(conditions.joined(separator: " AND "))
                 """,
                 values
@@ -350,7 +370,7 @@ public actor EvidenceStore {
             sql = """
             SELECT DISTINCT m.json
             FROM message_search
-            CROSS JOIN messages m ON m.id = message_search.message_id
+            CROSS JOIN messages m ON m.rowid = message_search.rowid
             CROSS JOIN memberships hm INDEXED BY idx_memberships_hold ON hm.message_id = m.id
             CROSS JOIN source_archives a ON a.id = hm.source_archive_id AND a.complete = 1
             """
@@ -428,14 +448,22 @@ public actor EvidenceStore {
 
     public func thread(holdID: String, threadID: String) throws -> [EvidenceMessage] {
         guard let hold = try storedHold(id: holdID), hold.status == .active else { return [] }
-        var conditions = ["hm.hold_id = ?", "m.thread_id = ?"]
-        var values: [SQLiteValue] = [.text(holdID), .text(threadID)]
+        var conditions = [
+            "m.thread_id = ?",
+            """
+            EXISTS (
+                SELECT 1
+                FROM memberships hm INDEXED BY idx_memberships_hold
+                JOIN source_archives a ON a.id = hm.source_archive_id AND a.complete = 1
+                WHERE hm.hold_id = ? AND hm.message_id = m.id
+            )
+            """,
+        ]
+        var values: [SQLiteValue] = [.text(threadID), .text(holdID)]
         Self.appendHoldScope(hold, conditions: &conditions, values: &values)
         return try rows(
             """
-            SELECT DISTINCT m.json FROM messages m
-            JOIN memberships hm ON hm.message_id = m.id
-            JOIN source_archives a ON a.id = hm.source_archive_id AND a.complete = 1
+            SELECT m.json FROM messages m
             WHERE \(conditions.joined(separator: " AND "))
             ORDER BY m.posted_at ASC
             """,
@@ -491,7 +519,7 @@ public actor EvidenceStore {
         // costs a few identifiers instead of the whole message and its retained raw Slack JSON.
         let messages: [EvidenceMessage] = try rows(
             """
-            SELECT m.json FROM messages m
+            SELECT m.json, m.raw_json FROM messages m
             WHERE m.id IN (
                 SELECT hm.message_id FROM memberships hm
                 JOIN source_archives a ON a.id = hm.source_archive_id AND a.complete = 1
@@ -501,7 +529,9 @@ public actor EvidenceStore {
             """,
             [.text(hold.id)]
         ) { statement in
-            try Self.decoder.decode(EvidenceMessage.self, from: columnData(statement, 0))
+            var message = try Self.decoder.decode(EvidenceMessage.self, from: columnData(statement, 0))
+            message.rawJSON = columnData(statement, 1)
+            return message
         }
         let memberships: [HoldMembership] = try rows(
             """
@@ -565,11 +595,11 @@ public actor EvidenceStore {
         try replaceCustodians(custodians, holdID: hold.id)
         var importedArchives = 0
         var importedMessages = 0
+        let membershipsByArchive = Dictionary(grouping: snapshot.memberships, by: \.sourceArchiveID)
         for archive in snapshot.archives {
             if try sourceArchive(sha256: archive.sha256, holdID: hold.id) != nil { continue }
             try beginImport(archive)
-            let records = snapshot.memberships
-                .filter { $0.sourceArchiveID == archive.id }
+            let records = (membershipsByArchive[archive.id] ?? [])
                 .compactMap { membership in
                     messages[membership.messageID].map {
                         EvidenceImportRecord(message: $0, membership: membership)
@@ -592,7 +622,6 @@ public actor EvidenceStore {
         guard existed > 0 else { return false }
         try transaction {
             try run("DELETE FROM source_archives WHERE hold_id = ?", [.text(holdID)])
-            try execute("DELETE FROM message_search WHERE message_id IN (SELECT id FROM messages WHERE NOT EXISTS (SELECT 1 FROM memberships WHERE memberships.message_id = messages.id))")
             try execute("DELETE FROM messages WHERE NOT EXISTS (SELECT 1 FROM memberships WHERE memberships.message_id = messages.id)")
             try rebuildNormalizedTables()
         }
@@ -602,7 +631,6 @@ public actor EvidenceStore {
     public func purge() throws {
         try transaction {
             try execute("DELETE FROM memberships")
-            try execute("DELETE FROM message_search")
             try execute("DELETE FROM evidence_files")
             try execute("DELETE FROM reactions")
             try execute("DELETE FROM threads")
@@ -664,8 +692,8 @@ public actor EvidenceStore {
         try run(
             """
             INSERT OR IGNORE INTO messages(id, organization_id, conversation_id, conversation_name, conversation_kind, thread_id,
-                sender_id, sender_name, text, posted_at, edited_at, deleted, has_attachment, file_types, json)
-            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                sender_id, sender_name, text, posted_at, edited_at, deleted, has_attachment, file_types, file_text, json, raw_json)
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 .text(message.id), .text(organizationID),
@@ -673,14 +701,22 @@ public actor EvidenceStore {
                 .text(message.threadID), .text(message.senderID), .text(message.senderName), .text(message.text),
                 .double(message.postedAt.timeIntervalSince1970), message.editedAt.map { .double($0.timeIntervalSince1970) } ?? .null,
                 .int(message.isDeleted ? 1 : 0), .int(message.files.isEmpty ? 0 : 1),
-                .text(message.files.compactMap(\.mimeType).joined(separator: " ")), .blob(try Self.encoder.encode(message)),
+                .text(message.files.compactMap(\.mimeType).joined(separator: " ")), .text(fileText),
+                .blob(try Self.strippedBlob(message)), .blob(message.rawJSON),
             ]
         )
         let inserted = sqlite3_changes(database) > 0
         if inserted {
+            // Inserted by hand rather than by an AFTER INSERT trigger: a trigger makes every
+            // INSERT open a statement journal, which costs an allocation-and-mlock round trip
+            // per message under cipher_memory_security. The delete and update triggers keep
+            // the index correct on those (cold) paths.
             try run(
-                "INSERT INTO message_search(message_id, text, sender_name, conversation_name, file_text) VALUES(?, ?, ?, ?, ?)",
-                [.text(message.id), .text(message.text), .text(message.senderName), .text(message.conversationName), .text(fileText)]
+                "INSERT INTO message_search(rowid, text, sender_name, conversation_name, file_text) VALUES(?, ?, ?, ?, ?)",
+                [
+                    .int(sqlite3_last_insert_rowid(database)), .text(message.text),
+                    .text(message.senderName), .text(message.conversationName), .text(fileText),
+                ]
             )
             try upsertNormalized(
                 message: message,
@@ -700,11 +736,18 @@ public actor EvidenceStore {
         return inserted
     }
 
+    /// Schema version 5 is created in one shot; there is no upgrade path from earlier
+    /// versions. Evidence databases are rebuilt from the untouched source ZIPs instead.
+    private static let schemaVersion: Int64 = 5
+
     nonisolated private func migrate() throws {
         let currentVersion: Int64 = try firstRow("PRAGMA user_version") { sqlite3_column_int64($0, 0) } ?? 0
-        guard currentVersion <= 4 else {
-            throw ThreadLightError.database("This evidence database was created by a newer ThreadLight schema version.")
+        guard currentVersion == 0 || currentVersion == Self.schemaVersion else {
+            throw ThreadLightError.database(
+                "This evidence database uses an incompatible ThreadLight schema (version \(currentVersion)). Delete it and re-import the untouched source ZIPs."
+            )
         }
+        guard currentVersion == 0 else { return }
         try execute(
             """
             CREATE TABLE IF NOT EXISTS holds(
@@ -717,145 +760,101 @@ public actor EvidenceStore {
             );
             CREATE TABLE IF NOT EXISTS source_archives(
                 id TEXT PRIMARY KEY, hold_id TEXT NOT NULL, custodian_id TEXT NOT NULL,
+                sha256 TEXT NOT NULL,
                 complete INTEGER NOT NULL DEFAULT 0, imported_at REAL NOT NULL, json BLOB NOT NULL,
                 FOREIGN KEY(hold_id) REFERENCES holds(id) ON DELETE CASCADE
             );
             CREATE TABLE IF NOT EXISTS messages(
-                id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL, conversation_name TEXT NOT NULL,
+                id TEXT PRIMARY KEY, organization_id TEXT NOT NULL,
+                conversation_id TEXT NOT NULL, conversation_name TEXT NOT NULL,
                 conversation_kind TEXT NOT NULL, thread_id TEXT NOT NULL, sender_id TEXT NOT NULL,
                 sender_name TEXT NOT NULL, text TEXT NOT NULL, posted_at REAL NOT NULL,
                 edited_at REAL, deleted INTEGER NOT NULL, has_attachment INTEGER NOT NULL,
-                file_types TEXT NOT NULL, json BLOB NOT NULL
+                file_types TEXT NOT NULL, file_text TEXT NOT NULL,
+                json BLOB NOT NULL, raw_json BLOB NOT NULL
             );
             CREATE TABLE IF NOT EXISTS memberships(
                 hold_id TEXT NOT NULL, custodian_id TEXT NOT NULL, message_id TEXT NOT NULL,
-                source_archive_id TEXT NOT NULL,
+                source_archive_id TEXT NOT NULL, source_message_sha256 TEXT NOT NULL,
                 PRIMARY KEY(hold_id, custodian_id, message_id, source_archive_id),
                 FOREIGN KEY(message_id) REFERENCES messages(id) ON DELETE CASCADE,
                 FOREIGN KEY(source_archive_id) REFERENCES source_archives(id) ON DELETE CASCADE
             );
             CREATE VIRTUAL TABLE IF NOT EXISTS message_search USING fts5(
-                message_id UNINDEXED, text, sender_name, conversation_name, file_text,
+                text, sender_name, conversation_name, file_text,
+                content='messages',
                 tokenize='porter unicode61'
             );
+            CREATE TRIGGER IF NOT EXISTS messages_search_delete AFTER DELETE ON messages BEGIN
+                INSERT INTO message_search(message_search, rowid, text, sender_name, conversation_name, file_text)
+                VALUES ('delete', old.rowid, old.text, old.sender_name, old.conversation_name, old.file_text);
+            END;
+            CREATE TRIGGER IF NOT EXISTS messages_search_update AFTER UPDATE ON messages BEGIN
+                INSERT INTO message_search(message_search, rowid, text, sender_name, conversation_name, file_text)
+                VALUES ('delete', old.rowid, old.text, old.sender_name, old.conversation_name, old.file_text);
+                INSERT INTO message_search(rowid, text, sender_name, conversation_name, file_text)
+                VALUES (new.rowid, new.text, new.sender_name, new.conversation_name, new.file_text);
+            END;
+            CREATE TABLE IF NOT EXISTS users(
+                organization_id TEXT NOT NULL,
+                id TEXT NOT NULL,
+                display_name TEXT NOT NULL,
+                PRIMARY KEY(organization_id, id)
+            );
+            CREATE TABLE IF NOT EXISTS conversations(
+                organization_id TEXT NOT NULL,
+                id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                PRIMARY KEY(organization_id, id)
+            );
+            CREATE TABLE IF NOT EXISTS threads(
+                id TEXT PRIMARY KEY,
+                organization_id TEXT NOT NULL,
+                conversation_id TEXT NOT NULL,
+                root_message_id TEXT NOT NULL,
+                first_posted_at REAL NOT NULL,
+                last_posted_at REAL NOT NULL,
+                message_count INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS reactions(
+                message_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                count INTEGER NOT NULL,
+                user_ids_json BLOB NOT NULL,
+                PRIMARY KEY(message_id, name),
+                FOREIGN KEY(message_id) REFERENCES messages(id) ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS evidence_files(
+                message_id TEXT NOT NULL,
+                id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                mime_type TEXT,
+                byte_count INTEGER,
+                remote_url TEXT,
+                local_relative_path TEXT,
+                sha256 TEXT,
+                extracted_text TEXT,
+                PRIMARY KEY(message_id, id),
+                FOREIGN KEY(message_id) REFERENCES messages(id) ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS import_checkpoints(
+                source_archive_id TEXT PRIMARY KEY,
+                updated_at REAL NOT NULL,
+                json BLOB NOT NULL,
+                FOREIGN KEY(source_archive_id) REFERENCES source_archives(id) ON DELETE CASCADE
+            );
             CREATE INDEX IF NOT EXISTS idx_memberships_hold ON memberships(hold_id, message_id);
-            CREATE INDEX IF NOT EXISTS idx_messages_posted ON messages(posted_at DESC);
             CREATE INDEX IF NOT EXISTS idx_messages_posted_id ON messages(posted_at DESC, id DESC);
+            CREATE INDEX IF NOT EXISTS idx_messages_conversation
+                ON messages(conversation_id, conversation_name, conversation_kind, posted_at, id);
+            CREATE INDEX IF NOT EXISTS idx_messages_thread ON messages(thread_id, posted_at);
+            CREATE INDEX IF NOT EXISTS idx_threads_conversation ON threads(organization_id, conversation_id, last_posted_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_files_sha256 ON evidence_files(sha256) WHERE sha256 IS NOT NULL;
+            CREATE INDEX IF NOT EXISTS idx_source_archives_hash ON source_archives(hold_id, sha256, complete);
+            PRAGMA user_version = \(Self.schemaVersion);
             """
         )
-        var version = currentVersion
-        if version < 1 {
-            try execute("PRAGMA user_version = 1")
-            version = 1
-        }
-        if version < 2 {
-            try transaction {
-                try execute("ALTER TABLE messages ADD COLUMN organization_id TEXT NOT NULL DEFAULT ''")
-                try execute(
-                    """
-                    UPDATE messages
-                    SET organization_id = COALESCE(
-                        (SELECT h.organization_id
-                         FROM memberships hm
-                         JOIN holds h ON h.id = hm.hold_id
-                         WHERE hm.message_id = messages.id
-                         LIMIT 1),
-                        'unknown'
-                    )
-                    WHERE organization_id = '';
-
-                    CREATE TABLE users(
-                        organization_id TEXT NOT NULL,
-                        id TEXT NOT NULL,
-                        display_name TEXT NOT NULL,
-                        PRIMARY KEY(organization_id, id)
-                    );
-                    CREATE TABLE conversations(
-                        organization_id TEXT NOT NULL,
-                        id TEXT NOT NULL,
-                        name TEXT NOT NULL,
-                        kind TEXT NOT NULL,
-                        PRIMARY KEY(organization_id, id)
-                    );
-                    CREATE TABLE threads(
-                        id TEXT PRIMARY KEY,
-                        organization_id TEXT NOT NULL,
-                        conversation_id TEXT NOT NULL,
-                        root_message_id TEXT NOT NULL,
-                        first_posted_at REAL NOT NULL,
-                        last_posted_at REAL NOT NULL,
-                        message_count INTEGER NOT NULL
-                    );
-                    CREATE TABLE reactions(
-                        message_id TEXT NOT NULL,
-                        name TEXT NOT NULL,
-                        count INTEGER NOT NULL,
-                        user_ids_json BLOB NOT NULL,
-                        PRIMARY KEY(message_id, name),
-                        FOREIGN KEY(message_id) REFERENCES messages(id) ON DELETE CASCADE
-                    );
-                    CREATE TABLE evidence_files(
-                        message_id TEXT NOT NULL,
-                        id TEXT NOT NULL,
-                        name TEXT NOT NULL,
-                        mime_type TEXT,
-                        byte_count INTEGER,
-                        remote_url TEXT,
-                        local_relative_path TEXT,
-                        sha256 TEXT,
-                        extracted_text TEXT,
-                        PRIMARY KEY(message_id, id),
-                        FOREIGN KEY(message_id) REFERENCES messages(id) ON DELETE CASCADE
-                    );
-                    CREATE INDEX idx_threads_conversation ON threads(organization_id, conversation_id, last_posted_at DESC);
-                    CREATE INDEX idx_files_sha256 ON evidence_files(sha256) WHERE sha256 IS NOT NULL;
-                    """
-                )
-                try rebuildNormalizedTables()
-                try execute("PRAGMA user_version = 2")
-            }
-            version = 2
-        }
-        if version < 3 {
-            try transaction {
-                try execute("ALTER TABLE source_archives ADD COLUMN sha256 TEXT")
-                let archives: [(String, SourceArchive)] = try rows("SELECT id, json FROM source_archives") { statement in
-                    (columnText(statement, 0), try Self.decoder.decode(SourceArchive.self, from: columnData(statement, 1)))
-                }
-                for (id, archive) in archives {
-                    try run("UPDATE source_archives SET sha256 = ? WHERE id = ?", [.text(archive.sha256), .text(id)])
-                }
-                try execute(
-                    """
-                    CREATE INDEX idx_source_archives_hash ON source_archives(hold_id, sha256, complete);
-                    CREATE TABLE import_checkpoints(
-                        source_archive_id TEXT PRIMARY KEY,
-                        updated_at REAL NOT NULL,
-                        json BLOB NOT NULL,
-                        FOREIGN KEY(source_archive_id) REFERENCES source_archives(id) ON DELETE CASCADE
-                    );
-                    PRAGMA user_version = 3;
-                    """
-                )
-            }
-            version = 3
-        }
-        if version < 4 {
-            try transaction {
-                try execute("ALTER TABLE memberships ADD COLUMN source_message_sha256 TEXT NOT NULL DEFAULT ''")
-                let stored: [(String, EvidenceMessage)] = try rows("SELECT id, json FROM messages") { statement in
-                    (columnText(statement, 0), try Self.decoder.decode(EvidenceMessage.self, from: columnData(statement, 1)))
-                }
-                for (messageID, message) in stored {
-                    let sourceMessage = message.rawJSON.isEmpty ? try CanonicalJSON.encode(message) : message.rawJSON
-                    try run(
-                        "UPDATE memberships SET source_message_sha256 = ? WHERE message_id = ?",
-                        [.text(SHA256Digest.data(sourceMessage)), .text(messageID)]
-                    )
-                }
-                try execute("PRAGMA user_version = 4")
-            }
-        }
     }
 
     nonisolated private func holdOrganizationID(holdID: String) throws -> String {
@@ -1045,9 +1044,28 @@ public actor EvidenceStore {
         databaseLock.lock()
         defer { databaseLock.unlock() }
         guard let database else { throw ThreadLightError.database("Evidence database is closed.") }
-        var statement: OpaquePointer?
-        guard sqlite3_prepare_v2(database, sql, -1, &statement, nil) == SQLITE_OK, let statement else { throw databaseError() }
-        defer { sqlite3_finalize(statement) }
+        let statement: OpaquePointer
+        let cached: Bool
+        if let existing = statementCache[sql] {
+            statement = existing
+            cached = true
+        } else {
+            var prepared: OpaquePointer?
+            guard sqlite3_prepare_v2(database, sql, -1, &prepared, nil) == SQLITE_OK, let prepared else { throw databaseError() }
+            statement = prepared
+            cached = statementCache.count < 128
+            if cached { statementCache[sql] = statement }
+        }
+        // Reset on the way out, not before reuse: a statement left un-reset keeps its read
+        // snapshot and locks alive between calls.
+        defer {
+            if cached {
+                sqlite3_reset(statement)
+                sqlite3_clear_bindings(statement)
+            } else {
+                sqlite3_finalize(statement)
+            }
+        }
         for (offset, value) in values.enumerated() { try bind(value, to: statement, index: Int32(offset + 1)) }
         return try body(statement)
     }
@@ -1069,6 +1087,32 @@ public actor EvidenceStore {
     nonisolated private func databaseError() -> ThreadLightError {
         guard let database else { return .database("Evidence database is closed.") }
         return .database("Database operation failed: \(String(cString: sqlite3_errmsg(database)))")
+    }
+
+    /// Raw source JSON for the given messages, keyed by message ID. Loaded on demand so the
+    /// hot read paths never carry it: the raw bytes are only needed for evidence exports.
+    public func rawJSON(messageIDs: [String]) throws -> [String: Data] {
+        var found: [String: Data] = [:]
+        found.reserveCapacity(messageIDs.count)
+        let identifiers = messageIDs.sorted()
+        for offset in stride(from: 0, to: identifiers.count, by: 400) {
+            let batch = Array(identifiers[offset..<min(offset + 400, identifiers.count)])
+            _ = try rows(
+                "SELECT id, raw_json FROM messages WHERE id IN (\(Array(repeating: "?", count: batch.count).joined(separator: ",")))",
+                batch.map(SQLiteValue.text)
+            ) { statement in
+                found[columnText(statement, 0)] = columnData(statement, 1)
+            }
+        }
+        return found
+    }
+
+    /// The stored `json` blob excludes `rawJSON`; the raw source bytes live in their own
+    /// column so search and thread reads never decode them.
+    nonisolated private static func strippedBlob(_ message: EvidenceMessage) throws -> Data {
+        var stripped = message
+        stripped.rawJSON = Data()
+        return try encoder.encode(stripped)
     }
 
     private static let encoder: JSONEncoder = {
@@ -1127,7 +1171,7 @@ private enum SearchPredicateCompiler {
         switch expression {
         case .term, .phrase, .near:
             return .init(
-                sql: "m.id IN (SELECT message_id FROM message_search WHERE message_search MATCH ?)",
+                sql: "m.rowid IN (SELECT rowid FROM message_search WHERE message_search MATCH ?)",
                 values: [.text(expression.fts5())]
             )
         case let .and(lhs, rhs):

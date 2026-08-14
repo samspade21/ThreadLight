@@ -258,47 +258,14 @@ import ZIPFoundation
     #expect(try await fixture.store.attachmentAvailability(holdID: fixture.hold.id) == (referenced: 1, available: 1))
 }
 
-@Test func schemaVersionOneDatabaseMigratesAndBackfillsNormalizedRecords() async throws {
+@Test func incompatibleSchemaVersionDatabaseIsRejected() async throws {
     let root = FileManager.default.temporaryDirectory.appending(path: "ThreadLightMigration-\(UUID())", directoryHint: .isDirectory)
     try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
     defer { try? FileManager.default.removeItem(at: root) }
     let databaseURL = root.appending(path: "evidence.sqlite")
     let key = Data(repeating: 6, count: 32)
-    let hold = LegalHold(id: "HM", organizationID: "EM", name: "Migration", status: .active, createdAt: .now, updatedAt: .now)
-    let custodian = Custodian(id: "UM", holdID: hold.id, displayName: "Migration User")
-    let archive = SourceArchive(
-        holdID: hold.id,
-        custodianID: custodian.id,
-        originalFilename: "migration.zip",
-        sha256: String(repeating: "b", count: 64),
-        coverageStart: nil,
-        coverageEnd: nil,
-        operatorBinding: "Migration Test",
-        isPerCustodian: true
-    )
-    let message = EvidenceMessage(
-        id: "EM:CM:1.000001",
-        conversationID: "CM",
-        conversationName: "migration",
-        conversationKind: .privateChannel,
-        threadID: "EM:CM:1.000001",
-        senderID: custodian.id,
-        senderName: custodian.displayName,
-        text: "migration marker",
-        postedAt: Date(timeIntervalSince1970: 1),
-        reactions: [.init(name: "white_check_mark", count: 1, userIDs: [custodian.id])],
-        files: [.init(id: "FM", name: "migration.txt", mimeType: "text/plain")]
-    )
     do {
-        let original = try EvidenceStore(url: databaseURL, key: key)
-        try await original.save(hold: hold)
-        try await original.replaceCustodians([custodian], holdID: hold.id)
-        try await original.beginImport(archive)
-        _ = try await original.insert(
-            message: message,
-            membership: .init(holdID: hold.id, custodianID: custodian.id, messageID: message.id, sourceArchiveID: archive.id)
-        )
-        try await original.completeImport(archive)
+        _ = try EvidenceStore(url: databaseURL, key: key)
     }
     await Task.yield()
 
@@ -307,29 +274,15 @@ import ZIPFoundation
     let keyHex = key.map { String(format: "%02x", $0) }.joined()
     let downgradeSQL = """
     PRAGMA key = "x'\(keyHex)'";
-    DROP TABLE import_checkpoints;
-    DROP INDEX idx_source_archives_hash;
-    DROP TABLE evidence_files;
-    DROP TABLE reactions;
-    DROP TABLE threads;
-    DROP TABLE conversations;
-    DROP TABLE users;
-    ALTER TABLE memberships DROP COLUMN source_message_sha256;
-    ALTER TABLE messages DROP COLUMN organization_id;
-    ALTER TABLE source_archives DROP COLUMN sha256;
-    PRAGMA user_version = 1;
+    PRAGMA user_version = 4;
     """
     #expect(sqlite3_exec(rawDatabase, downgradeSQL, nil, nil, nil) == SQLITE_OK)
     #expect(sqlite3_close(rawDatabase) == SQLITE_OK)
 
-    let migrated = try EvidenceStore(url: databaseURL, key: key)
-    let counts = try await migrated.normalizedRecordCounts()
-    #expect(counts.users == 1)
-    #expect(counts.conversations == 1)
-    #expect(counts.threads == 1)
-    #expect(counts.reactions == 1)
-    #expect(counts.files == 1)
-    #expect(try await migrated.search(holdID: hold.id, query: .init(text: "migration marker")).map(\.id) == [message.id])
+    // There is no upgrade path; evidence databases are rebuilt from the untouched source ZIPs.
+    #expect(throws: (any Error).self) {
+        _ = try EvidenceStore(url: databaseURL, key: key)
+    }
 }
 
 @Test func wrongDatabaseKeyCannotReadEvidence() async throws {

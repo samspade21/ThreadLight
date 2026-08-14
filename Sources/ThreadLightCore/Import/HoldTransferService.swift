@@ -30,12 +30,16 @@ public struct HoldTransferResult: Sendable {
 }
 
 public struct HoldTransferService: Sendable {
-    /// Version 3 deflates the canonical JSON before sealing it. Slack's own exports of this
-    /// content compress about ten to one, and encrypted output cannot be compressed afterwards,
-    /// so an uncompressed payload threw that away and pushed packages toward the size ceiling.
-    private static let magic = Data("THREADLIGHT-HOLD-3\n".utf8)
+    /// Version 4 splits the deflated canonical JSON into framed chunks, each sealed with its
+    /// own AES-GCM box. The chunk index and a final-chunk flag are authenticated data, so a
+    /// reordered, duplicated, or truncated frame sequence fails to open instead of decoding
+    /// to something plausible. Framing also removes version 3's single 2 GB sealed buffer
+    /// and its whole-payload decrypt copies.
+    private static let magic = Data("THREADLIGHT-HOLD-4\n".utf8)
     private static let saltCount = 32
     private static let maximumBytes = 2 * 1_024 * 1_024 * 1_024
+    private static let chunkBytes = 4 * 1_024 * 1_024
+    private static let keyInfo = Data("dev.threadlight.hold-transfer.v4".utf8)
     /// OWASP's PBKDF2-HMAC-SHA256 floor. Derived once per transfer, not once per candidate hold.
     private static let passphraseIterations: UInt32 = 600_000
     private let store: EvidenceStore
@@ -67,13 +71,26 @@ public struct HoldTransferService: Sendable {
         let secret = try Self.normalizedPassphrase(passphrase)
         let stretched = try secret.map { try Self.stretch(passphrase: $0, salt: salt) }
         let key = Self.key(hold: hold, custodians: custodians, salt: salt, stretchedPassphrase: stretched)
-        guard let sealed = try AES.GCM.seal(compressed, using: key).combined else {
-            throw ThreadLightError.export("Could not encrypt the hold transfer.")
-        }
         var output = Self.magic
         output.append(secret == nil ? 0 : 1)
         output.append(salt)
-        output.append(sealed)
+        var chunkIndex: UInt64 = 0
+        var offset = compressed.startIndex
+        repeat {
+            let end = min(offset + Self.chunkBytes, compressed.endIndex)
+            let isFinal = end == compressed.endIndex
+            guard let sealed = try AES.GCM.seal(
+                compressed[offset..<end],
+                using: key,
+                authenticating: Self.chunkAAD(index: chunkIndex, isFinal: isFinal)
+            ).combined else {
+                throw ThreadLightError.export("Could not encrypt the hold transfer.")
+            }
+            withUnsafeBytes(of: UInt32(sealed.count).bigEndian) { output.append(contentsOf: $0) }
+            output.append(sealed)
+            offset = end
+            chunkIndex += 1
+        } while offset < compressed.endIndex
         try output.write(to: destination, options: [.atomic, .completeFileProtection])
         return destination
     }
@@ -99,7 +116,7 @@ public struct HoldTransferService: Sendable {
         let values = try url.resourceValues(forKeys: [.fileSizeKey, .isRegularFileKey, .isSymbolicLinkKey])
         guard values.isRegularFile == true, values.isSymbolicLink != true,
               let size = values.fileSize, size > Self.magic.count + 1 + Self.saltCount,
-              size <= Self.maximumBytes + 1_024 else {
+              size <= Self.maximumBytes + 1_048_576 else {
             throw ThreadLightError.archive("Choose a regular ThreadLight hold transfer no larger than 2 GB.")
         }
         let data = try Data(contentsOf: url, options: [.mappedIfSafe])
@@ -113,7 +130,7 @@ public struct HoldTransferService: Sendable {
         }
         let saltStart = flagIndex + 1
         let salt = data.subdata(in: saltStart..<(saltStart + Self.saltCount))
-        let sealed = data.subdata(in: (saltStart + Self.saltCount)..<data.endIndex)
+        let frames = data[(saltStart + Self.saltCount)...]
 
         let secret = try Self.normalizedPassphrase(passphrase)
         guard requiresPassphrase == (secret != nil) else {
@@ -129,9 +146,9 @@ public struct HoldTransferService: Sendable {
 
         for candidate in candidates where candidate.hold.status == .active {
             do {
-                let opened = try AES.GCM.open(
-                    .init(combined: sealed),
-                    using: Self.key(
+                let opened = try Self.openChunks(
+                    frames,
+                    key: Self.key(
                         hold: candidate.hold,
                         custodians: candidate.custodians,
                         salt: salt,
@@ -191,9 +208,52 @@ public struct HoldTransferService: Sendable {
         return HKDF<SHA256>.deriveKey(
             inputKeyMaterial: SymmetricKey(data: material),
             salt: salt,
-            info: Data("dev.threadlight.hold-transfer.v2".utf8),
+            info: keyInfo,
             outputByteCount: 32
         )
+    }
+
+    private static func chunkAAD(index: UInt64, isFinal: Bool) -> Data {
+        var aad = keyInfo
+        withUnsafeBytes(of: index.bigEndian) { aad.append(contentsOf: $0) }
+        aad.append(isFinal ? 1 : 0)
+        return aad
+    }
+
+    /// Opens the framed chunk sequence and returns the reassembled deflated payload.
+    ///
+    /// A wrong key fails on the first chunk's tag, so trying candidate holds stays cheap.
+    /// Malformed framing throws a ThreadLightError, which the candidate loop does not
+    /// swallow: a damaged file reports as damaged rather than as "no matching hold".
+    private static func openChunks(_ frames: Data, key: SymmetricKey) throws -> Data {
+        var compressed = Data()
+        var offset = frames.startIndex
+        var index: UInt64 = 0
+        while offset < frames.endIndex {
+            guard frames.endIndex - offset >= 4 else {
+                throw ThreadLightError.archive("This hold transfer is truncated mid-frame.")
+            }
+            let sealedCount = frames[offset..<(offset + 4)].reduce(0) { ($0 << 8) | Int($1) }
+            // AES-GCM overhead is a 12-byte nonce plus a 16-byte tag.
+            guard sealedCount >= 28,
+                  sealedCount <= chunkBytes + 28,
+                  frames.endIndex - offset - 4 >= sealedCount else {
+                throw ThreadLightError.archive("This hold transfer contains an invalid frame.")
+            }
+            let frameEnd = offset + 4 + sealedCount
+            let opened = try AES.GCM.open(
+                .init(combined: frames[(offset + 4)..<frameEnd]),
+                using: key,
+                authenticating: chunkAAD(index: index, isFinal: frameEnd == frames.endIndex)
+            )
+            guard compressed.count + opened.count <= maximumBytes else {
+                throw ThreadLightError.archive("This hold transfer expands beyond the 2 GB transfer limit.")
+            }
+            compressed.append(opened)
+            offset = frameEnd
+            index += 1
+        }
+        return compressed
     }
 
     private static func deflate(_ data: Data) throws -> Data {

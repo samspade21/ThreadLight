@@ -203,7 +203,7 @@ public struct SlackExportImporter: Sendable {
                         )
                         batch.append(.init(message: message, membership: membership))
                         batchBytes += message.rawJSON.count
-                        if batch.count == 500 || batchBytes >= 8 * 1_024 * 1_024 {
+                        if batch.count == 2_000 || batchBytes >= 8 * 1_024 * 1_024 {
                             let counts = try await store.insert(records: batch)
                             checkpoint.messagesProcessed += batch.count
                             checkpoint.messagesImported += counts.inserted
@@ -651,10 +651,24 @@ enum SHA256Digest {
             try Task.checkCancellation()
             hasher.update(data: chunk)
         }
-        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+        return hex(hasher.finalize())
     }
 
     static func data(_ data: Data) -> String {
-        SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+        hex(SHA256.hash(data: data))
+    }
+
+    private static let hexDigits = Array("0123456789abcdef".utf8)
+
+    // String(format: "%02x") re-parses the format string per byte; imports hash every
+    // message, so this runs tens of millions of times.
+    private static func hex(_ digest: some Sequence<UInt8>) -> String {
+        var output = [UInt8]()
+        output.reserveCapacity(64)
+        for byte in digest {
+            output.append(hexDigits[Int(byte >> 4)])
+            output.append(hexDigits[Int(byte & 0x0F)])
+        }
+        return String(decoding: output, as: UTF8.self)
     }
 }
