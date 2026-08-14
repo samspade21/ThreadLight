@@ -7,6 +7,7 @@ DerivedData/
 *.moved-aside
 .swiftpm/xcode/package.xcworkspace/xcuserdata/
 *.p12
+.signing.env
 *.mobileprovision
 *.token
 *.evidence.sqlite*
