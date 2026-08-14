@@ -41,16 +41,18 @@ FRAMEWORK_TEAM=$(print -r -- "$FRAMEWORK_SIGNATURE" | sed -n 's/^TeamIdentifier=
     exit 6
 }
 
-ENTITLEMENTS_FILE=$(mktemp /tmp/threadlight-release-entitlements.XXXXXX.plist)
+ENTITLEMENTS_FILE=$(mktemp "${TMPDIR:-/tmp}/threadlight-release-entitlements.XXXXXX")
 trap 'rm -f "$ENTITLEMENTS_FILE"' EXIT
 codesign -d --entitlements :- "$RELEASE_APP" > "$ENTITLEMENTS_FILE" 2>/dev/null
 
+# plutil -extract reads its argument as a dot-separated key path, so every dot
+# inside an entitlement name must be escaped or the lookup silently misses.
 for entitlement in \
     com.apple.security.app-sandbox \
     com.apple.security.network.client \
     com.apple.security.files.user-selected.read-write
 do
-    [[ "$(plutil -extract "$entitlement" raw -o - "$ENTITLEMENTS_FILE")" == "true" ]] || {
+    [[ "$(plutil -extract "${entitlement//./\\.}" raw -o - "$ENTITLEMENTS_FILE")" == "true" ]] || {
         print -u2 "Required production entitlement is missing: $entitlement"
         exit 7
     }
@@ -62,7 +64,7 @@ for forbidden in \
     com.apple.security.cs.allow-dyld-environment-variables \
     com.apple.security.get-task-allow
 do
-    if plutil -extract "$forbidden" raw -o - "$ENTITLEMENTS_FILE" >/dev/null 2>&1; then
+    if plutil -extract "${forbidden//./\\.}" raw -o - "$ENTITLEMENTS_FILE" >/dev/null 2>&1; then
         print -u2 "Forbidden production entitlement is present: $forbidden"
         exit 8
     fi
