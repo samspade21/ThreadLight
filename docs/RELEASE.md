@@ -4,7 +4,7 @@ Production release is blocked until every gate below is complete.
 
 ## Required gates
 
-- Dataminr E2E: an Enterprise organization owner installs the customer-owned PKCE app; an account with Legal Holds access authorizes it; ThreadLight lists real policies and member entity IDs.
+- Enterprise Grid E2E: an Enterprise organization owner installs the customer-owned PKCE app; an account with Legal Holds access authorizes it; ThreadLight lists real policies and member entity IDs.
 - Package-transfer E2E: multiple hold-wide ZIPs normalize, encrypt, auto-match, import, search, export, and verify successfully.
 - Senior engineering review: SQLCipher schema v4, v1→v4 migration/backfill and rollback strategy, source-specific message provenance, checkpoint recovery, organization isolation, and retention behavior.
 - AppSec review: OAuth, archive parsing, local encryption, evidence scope, dependency audit, and signing claims.
@@ -53,6 +53,6 @@ NOTARY_PROFILE='threadlight-notary' \
 
 A Developer ID build now requires a notary profile and fails unless Apple's final status is `Accepted`. The release verifier independently requires the Developer ID authority and team, hardened runtime, production-only entitlements, same-team SQLCipher signature, no demo hooks, a valid stapled ticket, and Gatekeeper acceptance. ThreadLight does not emit a merely signed-but-unnotarized production app.
 
-The ad-hoc build is for local testing only. It uses development-only local keys, session-only OAuth, and ephemeral evidence signatures so rebuilds do not trigger Keychain prompts. It is not a distributable signed/notarized release and is not byte-for-byte comparable with a timestamped production signature.
+The ad-hoc build is for local testing only. It keeps OAuth tokens in macOS Keychain so sessions survive relaunches, while using development-only local database keys and ephemeral evidence signatures. A rebuild may cause macOS to request Keychain authorization. It is not a distributable signed/notarized release and is not byte-for-byte comparable with a timestamped production signature.
 
 The reproducibility check compares every file in two ad-hoc app bundles built from the same checkout, lockfile, and local Swift/Xcode toolchain. Developer ID signatures and notarization tickets contain external timestamps and are verified for trust, not byte equality.

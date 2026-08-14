@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 import ThreadLightCore
 
@@ -20,24 +21,26 @@ struct MessageDetailView: View {
                         Text(message.postedAt.formatted(date: .complete, time: .standard)).foregroundStyle(.secondary)
                     }
                     HStack(alignment: .top, spacing: 12) {
-                        let avatarColor = ThreadLightTheme.avatarColor(for: message.senderID)
-                        Circle().fill(avatarColor.opacity(0.16)).frame(width: 42, height: 42)
-                            .overlay(Text(message.senderName.prefix(1).uppercased()).font(.title3.bold()).foregroundStyle(.primary))
+                        SlackAvatar(
+                            name: message.senderName,
+                            userID: message.senderID,
+                            url: model.slackUserProfiles[message.senderID]?.avatarURL,
+                            size: 42
+                        )
                         VStack(alignment: .leading, spacing: 6) {
                             Text(message.senderName).font(.headline)
                             Text(message.text.isEmpty ? "(No message text)" : message.text)
                                 .textSelection(.enabled)
                         }
                     }
-                    if let reactions = message.reactions, !reactions.isEmpty {
+                    if !displayedReactions(for: message).isEmpty {
                         HStack(spacing: 7) {
-                            ForEach(reactions, id: \.self) { reaction in
-                                Text(":\(reaction.name):  \(reaction.count)")
-                                    .font(.caption.weight(.medium))
-                                    .padding(.horizontal, 8)
-                                    .padding(.vertical, 4)
-                                    .background(.secondary.opacity(0.09), in: Capsule())
-                                    .help(reaction.userIDs.isEmpty ? "Reaction from Slack export" : "Slack user IDs: \(reaction.userIDs.joined(separator: ", "))")
+                            ForEach(displayedReactions(for: message), id: \.self) { reaction in
+                                SlackReactionView(
+                                    reaction: reaction,
+                                    customEmojiURL: model.slackEmojiURLs[reaction.name],
+                                    compact: false
+                                )
                             }
                         }
                     }
@@ -85,24 +88,54 @@ struct MessageDetailView: View {
                         }
                     }
                     Divider()
-                    Label("Evidence identifiers", systemImage: "fingerprint")
-                        .font(.headline)
-                        .foregroundStyle(ThreadLightTheme.accentForeground)
-                    Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 8) {
-                        GridRow { Text("Message ID").foregroundStyle(.secondary); Text(message.id).font(.system(.caption, design: .monospaced)).textSelection(.enabled) }
-                        GridRow { Text("Thread ID").foregroundStyle(.secondary); Text(message.threadID).font(.system(.caption, design: .monospaced)).textSelection(.enabled) }
-                        GridRow { Text("Conversation ID").foregroundStyle(.secondary); Text(message.conversationID).font(.system(.caption, design: .monospaced)).textSelection(.enabled) }
+                    Button {
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(identifierText(for: message), forType: .string)
+                    } label: {
+                        HStack(spacing: 6) {
+                            Image(systemName: "fingerprint")
+                            Text("Evidence identifiers")
+                            Spacer()
+                            Text("Click to copy")
+                                .foregroundStyle(.tertiary)
+                        }
+                        .contentShape(Rectangle())
                     }
-                    .padding(14)
-                    .threadLightCard()
+                    .buttonStyle(.plain)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 7)
+                    .background(.secondary.opacity(0.06), in: RoundedRectangle(cornerRadius: 8))
+                    .help(identifierText(for: message))
+                    .accessibilityLabel("Copy evidence identifiers")
                     }
                     .padding(24)
                     .frame(maxWidth: .infinity, alignment: .leading)
                 }
             }
-            .navigationTitle("Message")
+            .task(id: message.id) {
+                await model.refreshReactions(for: message)
+            }
         } else {
             ContentUnavailableView("Select a message", systemImage: "text.bubble", description: Text("Choose a search result to inspect the complete message and resource provenance."))
         }
+    }
+
+    private func identifierText(for message: EvidenceMessage) -> String {
+        var identifiers = [
+            "Message ID: \(message.id)",
+            "Thread ID: \(message.threadID)",
+            "Conversation ID: \(message.conversationID)",
+            "Sender ID: \(message.senderID)",
+        ]
+        if let holdID = model.selectedHold?.id {
+            identifiers.insert("Legal hold ID: \(holdID)", at: 0)
+        }
+        return identifiers.joined(separator: "\n")
+    }
+
+    private func displayedReactions(for message: EvidenceMessage) -> [EvidenceReaction] {
+        model.liveReactions[message.id] ?? message.reactions ?? []
     }
 }

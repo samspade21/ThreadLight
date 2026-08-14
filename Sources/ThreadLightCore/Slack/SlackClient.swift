@@ -29,9 +29,23 @@ public struct OAuthTokenSet: Codable, Sendable {
         return expiresAt.timeIntervalSinceNow < 120
     }
 
-    public var hasExactLegalHoldsReadScope: Bool {
+    public var hasExactThreadLightUserScopes: Bool {
         let scopes = Set(scope.split(whereSeparator: { $0 == "," || $0.isWhitespace }).map(String.init))
-        return scopes == ["admin.legal_holds:read"]
+        return scopes == SlackOAuth.requiredUserScopes
+    }
+}
+
+public struct SlackUserProfile: Hashable, Sendable {
+    public let id: String
+    public let displayName: String
+    public let email: String?
+    public let avatarURL: URL?
+
+    public init(id: String, displayName: String, email: String? = nil, avatarURL: URL?) {
+        self.id = id
+        self.displayName = displayName
+        self.email = email
+        self.avatarURL = avatarURL
     }
 }
 
@@ -122,6 +136,9 @@ public protocol LegalHoldClient: Sendable {
     func listPolicies(status: HoldStatus?) async throws -> [LegalHold]
     func policy(id: String) async throws -> LegalHold
     func listCustodians(policyID: String) async throws -> [Custodian]
+    func userProfile(userID: String) async throws -> SlackUserProfile
+    func reactions(conversationID: String, timestamp: String) async throws -> [EvidenceReaction]
+    func emojiURLs() async throws -> [String: URL]
 }
 
 public actor RefreshingLegalHoldClient: LegalHoldClient {
@@ -160,8 +177,20 @@ public actor RefreshingLegalHoldClient: LegalHoldClient {
         try await activeClient().listCustodians(policyID: policyID)
     }
 
+    public func userProfile(userID: String) async throws -> SlackUserProfile {
+        try await activeClient().userProfile(userID: userID)
+    }
+
+    public func reactions(conversationID: String, timestamp: String) async throws -> [EvidenceReaction] {
+        try await activeClient().reactions(conversationID: conversationID, timestamp: timestamp)
+    }
+
+    public func emojiURLs() async throws -> [String: URL] {
+        try await activeClient().emojiURLs()
+    }
+
     private func activeClient() async throws -> SlackLegalHoldClient {
-        guard tokens.hasExactLegalHoldsReadScope else { throw Self.invalidScope() }
+        guard tokens.hasExactThreadLightUserScopes else { throw Self.invalidScope() }
         if tokens.needsRefresh {
             guard let refreshToken = tokens.refreshToken, !refreshToken.isEmpty else {
                 throw ThreadLightError.authentication("The Slack session expired and cannot rotate. Reconnect Slack.")
@@ -175,14 +204,14 @@ public actor RefreshingLegalHoldClient: LegalHoldClient {
                 authorizedUserID: refreshed.authorizedUserID ?? tokens.authorizedUserID,
                 scope: refreshed.scope.isEmpty ? tokens.scope : refreshed.scope
             )
-            guard tokens.hasExactLegalHoldsReadScope else { throw Self.invalidScope() }
+            guard tokens.hasExactThreadLightUserScopes else { throw Self.invalidScope() }
             try await tokenVault.save(tokens, organizationID: organizationID)
         }
         return SlackLegalHoldClient(accessToken: tokens.accessToken, session: apiSession)
     }
 
     private static func invalidScope() -> ThreadLightError {
-        .authentication("Slack did not grant exactly admin.legal_holds:read. Remove every other user scope and reconnect from ThreadLight. Keep the installation bot scope team:read.")
+        .authentication("Slack did not grant ThreadLight's five read-only user scopes. Update the Slack app manifest, then reconnect. Keep the installation bot scope team:read.")
     }
 }
 
@@ -247,13 +276,89 @@ public actor SlackLegalHoldClient: LegalHoldClient {
                     ?? (row["name"] as? String)
                     ?? (profile?["display_name"] as? String)
                     ?? id
+                let avatarURL = ["image_72", "image_192", "image_512", "image_48"]
+                    .compactMap { profile?[$0] as? String }
+                    .compactMap(URL.init(string:))
+                    .first(where: Self.isSlackAvatarURL)
                 let deletedAt = (row["date_deleted"] as? NSNumber)?.doubleValue ?? 0
-                return Custodian(id: id, holdID: policyID, displayName: name, email: profile?["email"] as? String, isCurrent: deletedAt <= 0)
+                return Custodian(
+                    id: id,
+                    holdID: policyID,
+                    displayName: name,
+                    email: profile?["email"] as? String,
+                    avatarURL: avatarURL,
+                    isCurrent: deletedAt <= 0
+                )
             })
             cursor = ((object["response_metadata"] as? [String: Any])?["next_cursor"] as? String)
             if let cursor, !cursor.isEmpty, !seenCursors.insert(cursor).inserted { throw Self.invalidPagination() }
         } while cursor?.isEmpty == false
         return custodians.sorted { $0.displayName.localizedStandardCompare($1.displayName) == .orderedAscending }
+    }
+
+    public func userProfile(userID: String) async throws -> SlackUserProfile {
+        let object = try await call(method: "users.info", fields: ["user": userID])
+        guard let user = object["user"] as? [String: Any],
+              let id = user["id"] as? String,
+              id == userID else {
+            throw ThreadLightError.slack("Slack returned no profile for this user.", remediation: "The user may no longer be visible to the signed-in Slack account.")
+        }
+        let profile = user["profile"] as? [String: Any]
+        let displayName = [profile?["display_name"] as? String, profile?["real_name"] as? String, user["real_name"] as? String, user["name"] as? String]
+            .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .first { !$0.isEmpty } ?? id
+        let avatarURL = ["image_512", "image_192", "image_72", "image_48"]
+            .compactMap { profile?[$0] as? String }
+            .compactMap(URL.init(string:))
+            .first(where: Self.isSlackAvatarURL)
+        let email = (profile?["email"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+        return .init(id: id, displayName: displayName, email: email?.isEmpty == false ? email : nil, avatarURL: avatarURL)
+    }
+
+    public func reactions(conversationID: String, timestamp: String) async throws -> [EvidenceReaction] {
+        let object = try await call(
+            method: "reactions.get",
+            fields: ["channel": conversationID, "timestamp": timestamp, "full": "true"]
+        )
+        let message = object["message"] as? [String: Any]
+        return (message?["reactions"] as? [[String: Any]] ?? []).compactMap { row in
+            guard let name = row["name"] as? String, !name.isEmpty else { return nil }
+            let users = row["users"] as? [String] ?? []
+            let count = max(0, (row["count"] as? NSNumber)?.intValue ?? users.count)
+            return .init(name: name, count: count, userIDs: users)
+        }
+        .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+    }
+
+    public func emojiURLs() async throws -> [String: URL] {
+        let object = try await call(method: "emoji.list", fields: ["include_categories": "false"])
+        let entries = object["emoji"] as? [String: String] ?? [:]
+        var result: [String: URL] = [:]
+        for name in entries.keys {
+            var visited: Set<String> = []
+            if let url = Self.resolveEmojiURL(name: name, entries: entries, visited: &visited) {
+                result[name] = url
+            }
+        }
+        return result
+    }
+
+    private static func resolveEmojiURL(name: String, entries: [String: String], visited: inout Set<String>) -> URL? {
+        guard visited.insert(name).inserted, let value = entries[name] else { return nil }
+        if value.hasPrefix("alias:") {
+            return resolveEmojiURL(name: String(value.dropFirst("alias:".count)), entries: entries, visited: &visited)
+        }
+        guard let url = URL(string: value), isSlackImageURL(url) else { return nil }
+        return url
+    }
+
+    private static func isSlackAvatarURL(_ url: URL) -> Bool {
+        isSlackImageURL(url)
+    }
+
+    private static func isSlackImageURL(_ url: URL) -> Bool {
+        guard url.scheme?.lowercased() == "https", let host = url.host?.lowercased() else { return false }
+        return host == "secure.gravatar.com" || host.hasSuffix(".slack-edge.com")
     }
 
     private func call(method: String, fields: [String: String]) async throws -> [String: Any] {
@@ -354,7 +459,7 @@ public enum SlackErrorMapper {
         case "no_bot_scopes_requested":
             .slack("The Slack app is missing the bot scope required for authorization.", remediation: "Restore the app manifest's bot_user section and bot scope team:read, save it in Slack app settings, then sign in again.")
         case "missing_scope", "unknown_method":
-            .slack("Legal Holds read access is missing.", remediation: "Keep only admin.legal_holds:read under user scopes, retain bot scope team:read for organization installation, then reconnect from ThreadLight.")
+            .slack("Required Slack read access is missing.", remediation: "Use ThreadLight's manifest with admin.legal_holds:read, users:read, users:read.email, reactions:read, and emoji:read, then reconnect.")
         case "legal_hold_not_found":
             .slack("The legal hold no longer exists or is unavailable.", remediation: "Confirm the hold in Slack using Legal's Legal Holds administrator account. ThreadLight will not search or export it without a live match.")
         case "not_an_admin":

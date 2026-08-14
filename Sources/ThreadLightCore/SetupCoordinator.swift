@@ -146,7 +146,7 @@ public final class SetupCoordinator {
 
         ## Internal app
         1. Create an organization-owned internal app from the single included `docs/slack-app-manifest.yaml`.
-        2. Confirm bot scope `team:read`, user scope `admin.legal_holds:read`, PKCE, `https://callback.threadlight.invalid/oauth/callback`, and organization deployment.
+        2. Confirm bot scope `team:read`, user scopes `admin.legal_holds:read`, `users:read`, `users:read.email`, `reactions:read`, and `emoji:read`, PKCE, `https://callback.threadlight.invalid/oauth/callback`, and organization deployment.
         3. In that app's settings, open Install App and choose Install to Organization as an Org Owner. Select the Enterprise organization, not a workspace.
         4. Enter the public client ID in ThreadLight, then choose Connect IT Role to Slack. ThreadLight requests only the user scope and verifies it by listing Legal Hold policies.
         5. Create the signed Slack Admin handoff and return the entire response folder to the Legal Role.
@@ -182,7 +182,7 @@ public final class SetupCoordinator {
             requestedRole: "Slack Admin Role: Enterprise Org Owner and Export Admin",
             requestedActions: [
                 "Create the organization-owned internal Slack app from the single included manifest.",
-                "Keep bot scope team:read, user scope admin.legal_holds:read, PKCE, callback, and organization deployment unchanged.",
+                "Keep bot scope team:read and ThreadLight's five read-only user scopes, PKCE, callback, and organization deployment unchanged.",
                 "From that app's Settings → Install App page, install to the Enterprise organization as an Org Owner.",
                 "Connect from ThreadLight to authorize and verify the user-only desktop flow.",
                 "Enable approved custom/member JSON exports.",
@@ -384,15 +384,15 @@ public final class SetupCoordinator {
         ),
         .init(
             id: .readScope,
-            detail: "Configure bot scope team:read and user scope admin.legal_holds:read.",
-            why: "Slack requires a bot scope for organization installation. ThreadLight's desktop OAuth requests only the user scope and never stores or uses the bot token.",
+            detail: "Configure bot scope team:read and user scopes admin.legal_holds:read, users:read, users:read.email, reactions:read, and emoji:read.",
+            why: "Slack requires a bot scope for organization installation. The user scopes provide legal holds, current profiles, reactions, and workspace emoji; ThreadLight never stores or uses the bot token.",
             owner: .slackAdministrator,
             actionURL: URL(string: "https://api.slack.com/apps")
         ),
         .init(
             id: .enterpriseInstall,
             detail: "From the app's Settings → Install App page, install to the organization as an Org Owner, then verify from ThreadLight.",
-            why: "That app-specific installer correctly requests the configured bot scope; ThreadLight's later desktop OAuth requests only the Legal Holds user scope.",
+            why: "That app-specific installer correctly requests the configured bot scope; ThreadLight's later desktop OAuth requests only its five read-only user scopes.",
             owner: .slackAdministrator,
             actionURL: URL(string: "https://docs.slack.dev/enterprise/organization-ready-apps/")
         ),

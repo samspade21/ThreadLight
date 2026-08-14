@@ -38,6 +38,7 @@
         "threadID": { "type": "string", "minLength": 1 },
         "senderID": { "type": "string", "minLength": 1 },
         "senderName": { "type": "string" },
+        "senderAvatarURL": { "type": "string", "format": "uri" },
         "text": { "type": "string" },
         "postedAt": { "type": "string", "format": "date-time" },
         "editedAt": { "type": "string", "format": "date-time" },

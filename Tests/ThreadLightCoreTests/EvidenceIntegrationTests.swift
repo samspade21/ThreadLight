@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import PDFKit
 import SQLCipher
@@ -12,6 +13,98 @@ import ZIPFoundation
     let results = try await fixture.store.search(holdID: fixture.hold.id, query: .init(text: "approval from:Alex"))
     #expect(results.map(\.id) == [fixture.message.id])
     #expect(try await fixture.store.memberships(messageID: fixture.message.id, holdID: fixture.hold.id).count == 1)
+}
+
+@Test func encryptedStoreListsAndFiltersConversations() async throws {
+    let fixture = try StoreFixture()
+    defer { fixture.cleanup() }
+    try await fixture.seed()
+    let directMessage = EvidenceMessage(
+        id: "M-DM",
+        conversationID: "D1",
+        conversationName: "Alex Rivera, Morgan Lee",
+        conversationKind: .groupDirectMessage,
+        threadID: "M-DM",
+        senderID: fixture.custodian.id,
+        senderName: fixture.custodian.displayName,
+        text: "private review",
+        postedAt: fixture.message.postedAt.addingTimeInterval(1)
+    )
+    _ = try await fixture.store.insert(
+        message: directMessage,
+        membership: .init(
+            holdID: fixture.hold.id,
+            custodianID: fixture.custodian.id,
+            messageID: directMessage.id,
+            sourceArchiveID: fixture.archive.id
+        )
+    )
+
+    let conversations = try await fixture.store.conversations(holdID: fixture.hold.id)
+    #expect(Set(conversations.map(\.id)) == ["C1", "D1"])
+    #expect(conversations.first(where: { $0.id == "D1" })?.kind == .groupDirectMessage)
+
+    var filters = SearchFilters()
+    filters.conversationID = "D1"
+    let results = try await fixture.store.search(holdID: fixture.hold.id, query: .init(filters: filters))
+    #expect(results.map(\.id) == [directMessage.id])
+    let selected = try await fixture.store.messages(
+        holdID: fixture.hold.id,
+        messageIDs: [fixture.message.id, directMessage.id]
+    )
+    #expect(selected.map(\.id) == [fixture.message.id, directMessage.id])
+}
+
+@Test func encryptedStorePagesAndFiltersByPersonInvolvementAndDates() async throws {
+    let fixture = try StoreFixture()
+    defer { fixture.cleanup() }
+    try await fixture.seed()
+    let mentioned = EvidenceMessage(
+        id: "M-MENTION",
+        conversationID: "C1",
+        conversationName: "general",
+        conversationKind: .publicChannel,
+        threadID: "M-MENTION",
+        senderID: "U2",
+        senderName: "Morgan Lee",
+        text: "Please ask <@U1> to review this.",
+        postedAt: fixture.message.postedAt.addingTimeInterval(60)
+    )
+    let unrelated = EvidenceMessage(
+        id: "M-OTHER",
+        conversationID: "C1",
+        conversationName: "general",
+        conversationKind: .publicChannel,
+        threadID: "M-OTHER",
+        senderID: "U2",
+        senderName: "Morgan Lee",
+        text: "No person selected here.",
+        postedAt: fixture.message.postedAt.addingTimeInterval(120)
+    )
+    for message in [mentioned, unrelated] {
+        _ = try await fixture.store.insert(
+            message: message,
+            membership: .init(
+                holdID: fixture.hold.id,
+                custodianID: fixture.custodian.id,
+                messageID: message.id,
+                sourceArchiveID: fixture.archive.id
+            )
+        )
+    }
+
+    var filters = SearchFilters()
+    filters.personID = fixture.custodian.id
+    filters.after = fixture.message.postedAt.addingTimeInterval(-1)
+    filters.before = mentioned.postedAt.addingTimeInterval(1)
+    let involved = try await fixture.store.search(holdID: fixture.hold.id, query: .init(filters: filters))
+    #expect(involved.map(\.id) == [mentioned.id, fixture.message.id])
+
+    let secondPage = try await fixture.store.search(
+        holdID: fixture.hold.id,
+        query: .init(filters: filters, limit: 1, offset: 1)
+    )
+    #expect(secondPage.map(\.id) == [fixture.message.id])
 }
 
 @Test func encryptedStoreExecutesAdvancedProximitySearch() async throws {
@@ -261,6 +354,7 @@ import ZIPFoundation
     #expect(results.count == 1)
     #expect(results[0].id == "E1:C1:1785542400.000100")
     #expect(results[0].threadID == results[0].id)
+    #expect(results[0].senderAvatarURL == URL(string: "https://avatars.slack-edge.com/test.png"))
     let memberships = try await fixture.store.memberships(messageID: results[0].id, holdID: fixture.hold.id)
     #expect(memberships.first?.sourceMessageSHA256.count == 64)
 }
@@ -273,9 +367,9 @@ import ZIPFoundation
     let zipURL = fixture.root.appending(path: "nested-empty.zip")
     let archive = try Archive(url: zipURL, accessMode: .create, pathEncoding: nil)
     for (path, data) in [
-        ("teams/dataminr/users.json", Data(#"[{"id":"U1","profile":{"real_name":"Alex Rivera"}}]"#.utf8)),
-        ("teams/dataminr/channels.json", Data("[]".utf8)),
-        ("teams/dataminr/groups.json", Data("[]".utf8)),
+        ("teams/acme/users.json", Data(#"[{"id":"U1","profile":{"real_name":"Alex Rivera"}}]"#.utf8)),
+        ("teams/acme/channels.json", Data("[]".utf8)),
+        ("teams/acme/groups.json", Data("[]".utf8)),
     ] {
         try archive.addEntry(with: path, type: .file, uncompressedSize: Int64(data.count)) { offset, size in
             data.subdata(in: Int(offset)..<min(Int(offset) + size, data.count))
@@ -801,6 +895,36 @@ import ZIPFoundation
     let inconsistentSignature = try await signer.sign(manifest: inconsistentData)
     try CanonicalJSON.encode(inconsistentSignature).write(to: signatureURL, options: .atomic)
     #expect(try EvidenceExporter.verify(packageURL: result.packageURL) == false)
+
+    let invalidHoldWideBinding = EvidenceManifest(
+        schemaVersion: 1,
+        exportID: original.exportID,
+        createdAt: original.createdAt,
+        application: original.application,
+        hold: original.hold,
+        items: original.items,
+        sources: original.sources.map {
+            SourceArchive(
+                id: $0.id,
+                holdID: $0.holdID,
+                custodianID: $0.custodianID,
+                originalFilename: $0.originalFilename,
+                sha256: $0.sha256,
+                importedAt: $0.importedAt,
+                coverageStart: $0.coverageStart,
+                coverageEnd: $0.coverageEnd,
+                operatorBinding: $0.operatorBinding,
+                isPerCustodian: false
+            )
+        },
+        files: original.files,
+        warnings: original.warnings
+    )
+    let invalidHoldWideData = try CanonicalJSON.encode(invalidHoldWideBinding)
+    try invalidHoldWideData.write(to: result.manifestURL, options: .atomic)
+    let invalidHoldWideSignature = try await signer.sign(manifest: invalidHoldWideData)
+    try CanonicalJSON.encode(invalidHoldWideSignature).write(to: signatureURL, options: .atomic)
+    #expect(try EvidenceExporter.verify(packageURL: result.packageURL) == false)
 }
 
 @Test func evidenceExportFailsClosedWhenCustodianArchivesDisagreeOnMessageBytes() async throws {
@@ -891,6 +1015,137 @@ import ZIPFoundation
     #expect(FileManager.default.fileExists(atPath: pdfResult.packageURL.appending(path: "evidence.pdf").path))
     #expect(!FileManager.default.fileExists(atPath: pdfResult.packageURL.appending(path: "evidence.json").path))
     #expect(try EvidenceExporter.verify(packageURL: pdfResult.packageURL))
+}
+
+@Test func unsignedEvidenceExportWritesOnlyRequestedFlatFiles() async throws {
+    let fixture = try StoreFixture()
+    defer { fixture.cleanup() }
+    try await fixture.seed()
+
+    let result = try await EvidenceExporter(
+        store: fixture.store,
+        signer: EphemeralSignatureProvider()
+    ).exportFiles(
+        messages: [fixture.message],
+        hold: fixture.hold,
+        custodians: [fixture.custodian],
+        destination: fixture.root,
+        formats: [.pdf, .json]
+    )
+
+    #expect(result.fileURLs.map(\.pathExtension) == ["pdf", "json"])
+    #expect(result.fileURLs.allSatisfy { FileManager.default.fileExists(atPath: $0.path) })
+    #expect(try #require(PDFDocument(url: result.fileURLs[0])).pageCount > 0)
+    let json = try #require(JSONSerialization.jsonObject(with: Data(contentsOf: result.fileURLs[1])) as? [String: Any])
+    #expect(json["schemaVersion"] as? Int == 1)
+    let contents = try FileManager.default.contentsOfDirectory(at: fixture.root, includingPropertiesForKeys: [.isDirectoryKey])
+    #expect(!contents.contains { $0.pathExtension == "threadlight-evidence" })
+    #expect(!contents.contains { $0.lastPathComponent == "manifest.json" || $0.lastPathComponent == "manifest.threadlight-signature.json" })
+}
+
+@Test func conversationPDFExportWritesTheExactSavePanelDestination() async throws {
+    let fixture = try StoreFixture()
+    defer { fixture.cleanup() }
+    try await fixture.seed()
+    let destination = fixture.root.appending(path: "chosen-conversation.pdf")
+
+    let result = try await EvidenceExporter(
+        store: fixture.store,
+        signer: EphemeralSignatureProvider()
+    ).exportPDF(
+        messages: [fixture.message],
+        hold: fixture.hold,
+        custodians: [fixture.custodian],
+        destination: destination
+    )
+
+    #expect(result == destination)
+    #expect(try #require(PDFDocument(url: destination)).pageCount > 0)
+    #expect(!FileManager.default.fileExists(atPath: fixture.root.appending(path: "manifest.json").path))
+}
+
+@Test func jsonExportWritesTheExactSavePanelDestination() async throws {
+    let fixture = try StoreFixture()
+    defer { fixture.cleanup() }
+    try await fixture.seed()
+    let destination = fixture.root.appending(path: "chosen-evidence.json")
+
+    let result = try await EvidenceExporter(
+        store: fixture.store,
+        signer: EphemeralSignatureProvider()
+    ).exportJSON(
+        messages: [fixture.message],
+        hold: fixture.hold,
+        custodians: [fixture.custodian],
+        destination: destination
+    )
+
+    #expect(result == destination)
+    let document = try #require(JSONSerialization.jsonObject(with: Data(contentsOf: destination)) as? [String: Any])
+    let messages = try #require(document["messages"] as? [[String: Any]])
+    #expect(messages.compactMap { $0["id"] as? String } == [fixture.message.id])
+    #expect(!FileManager.default.fileExists(atPath: fixture.root.appending(path: "manifest.json").path))
+}
+
+@Test func evidencePDFRemainsVisibleWhenRenderedFromDarkMode() throws {
+    let root = FileManager.default.temporaryDirectory.appending(path: "ThreadLightPDF-\(UUID())", directoryHint: .isDirectory)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let destination = root.appending(path: "dark-mode.pdf")
+    let hold = LegalHold(id: "H-DARK", organizationID: "E1", name: "Visible Hold", status: .active, createdAt: .now, updatedAt: .now)
+    let message = EvidenceMessage(id: "M-DARK", conversationID: "C1", conversationName: "general", conversationKind: .publicChannel, threadID: "M-DARK", senderID: "U1", senderName: "Alex", text: "Visible evidence text", postedAt: .now)
+
+    var renderError: Error?
+    try #require(NSAppearance(named: .darkAqua)).performAsCurrentDrawingAppearance {
+        do {
+            try PDFRenderer.render(messages: [message], hold: hold, to: destination)
+        } catch {
+            renderError = error
+        }
+    }
+    if let renderError { throw renderError }
+    let pdf = try #require(PDFDocument(url: destination))
+    let page = try #require(pdf.page(at: 0))
+    let thumbnail = page.thumbnail(of: CGSize(width: 306, height: 396), for: .mediaBox)
+    let bitmap = try #require(thumbnail.tiffRepresentation.flatMap(NSBitmapImageRep.init(data:)))
+    var darkSamples = 0
+    for y in stride(from: 0, to: bitmap.pixelsHigh, by: 2) {
+        for x in stride(from: 0, to: bitmap.pixelsWide, by: 2) {
+            guard let color = bitmap.colorAt(x: x, y: y)?.usingColorSpace(.deviceRGB) else { continue }
+            if color.alphaComponent > 0.5, color.brightnessComponent < 0.7 {
+                darkSamples += 1
+            }
+        }
+    }
+    #expect(darkSamples > 50)
+}
+
+@Test func holdWideSlackPackageExportsMultipleMessagesAsVerifiedPDF() async throws {
+    let fixture = try StoreFixture()
+    defer { fixture.cleanup() }
+    try await fixture.store.save(hold: fixture.hold)
+    try await fixture.store.replaceCustodians([fixture.custodian], holdID: fixture.hold.id)
+    _ = try await SlackExportImporter(store: fixture.store).importHoldArchive(
+        url: fixture.makeSlackThreadExport(),
+        hold: fixture.hold,
+        operatorBinding: "Slack Administrator"
+    )
+    let messages = try await fixture.store.search(holdID: fixture.hold.id, query: .init(text: ""))
+    #expect(messages.count == 2)
+
+    let result = try await EvidenceExporter(
+        store: fixture.store,
+        signer: EphemeralSignatureProvider()
+    ).export(
+        messages: messages,
+        hold: fixture.hold,
+        custodians: [fixture.custodian],
+        destination: fixture.root,
+        formats: [.pdf]
+    )
+    let manifest = try CanonicalJSON.decoder.decode(EvidenceManifest.self, from: Data(contentsOf: result.manifestURL))
+    #expect(manifest.sources.allSatisfy { !$0.isPerCustodian && $0.custodianID == "threadlight:hold-wide" })
+    #expect(try EvidenceExporter.verify(packageURL: result.packageURL))
 }
 
 @Test func evidenceManifestCarriesCoverageAndMissingCustodianWarnings() async throws {
@@ -1128,7 +1383,7 @@ private final class StoreFixture: @unchecked Sendable {
         let source = root.appending(path: "slack", directoryHint: .isDirectory)
         let channel = source.appending(path: "general", directoryHint: .isDirectory)
         try FileManager.default.createDirectory(at: channel, withIntermediateDirectories: true)
-        try #"[{"id":"U1","name":"alex","profile":{"real_name":"Alex Rivera"}}]"#.write(to: source.appending(path: "users.json"), atomically: true, encoding: .utf8)
+        try #"[{"id":"U1","name":"alex","profile":{"real_name":"Alex Rivera","image_72":"https://avatars.slack-edge.com/test.png"}}]"#.write(to: source.appending(path: "users.json"), atomically: true, encoding: .utf8)
         try #"[{"id":"C1","name":"general"}]"#.write(to: source.appending(path: "channels.json"), atomically: true, encoding: .utf8)
         try #"[{"client_msg_id":"M2","user":"U1","text":"approval recorded","ts":"1785542400.000100"}]"#.write(to: channel.appending(path: "2026-08-01.json"), atomically: true, encoding: .utf8)
         let zip = root.appending(path: "slack-export.zip")

@@ -85,7 +85,7 @@ case "${1:-}" in
             exit 2
         }
         row=$((index + 1))
-        osascript -e "tell application \"System Events\" to tell process \"ThreadLight\" to set selected of row $row of outline 1 of scroll area 2 of group 2 of splitter group 1 of group 1 of window 1 to true"
+        osascript -e "tell application \"System Events\" to tell process \"ThreadLight\" to set selected of row $row of outline 1 of scroll area 3 of group 1 of splitter group 1 of group 1 of window 1 to true"
         ;;
     toggle-result)
         index=${2:-1}
@@ -94,7 +94,7 @@ case "${1:-}" in
             exit 2
         }
         row=$((index + 1))
-        osascript -e "tell application \"System Events\" to tell process \"ThreadLight\" to click button 1 of UI element 1 of row $row of outline 1 of scroll area 2 of group 2 of splitter group 1 of group 1 of window 1"
+        osascript -e "tell application \"System Events\" to tell process \"ThreadLight\" to click button 1 of UI element 1 of row $row of outline 1 of scroll area 3 of group 1 of splitter group 1 of group 1 of window 1"
         ;;
     export-selected)
         activate_app
@@ -213,10 +213,11 @@ case "${1:-}" in
         done
         [[ "$ready" == true ]] || { print -u2 "ThreadLight demo did not become ready."; exit 3; }
 
-        osascript -e 'tell application "System Events" to tell process "ThreadLight" to set selected of row 2 of outline 1 of scroll area 2 of group 2 of splitter group 1 of group 1 of window 1 to true'
-        osascript -e 'tell application "System Events" to tell process "ThreadLight" to click button 1 of UI element 1 of row 2 of outline 1 of scroll area 2 of group 2 of splitter group 1 of group 1 of window 1'
+        osascript -e 'tell application "System Events" to tell process "ThreadLight" to set selected of row 2 of outline 1 of scroll area 3 of group 1 of splitter group 1 of group 1 of window 1 to true'
+        osascript -e 'tell application "System Events" to tell process "ThreadLight" to click button 1 of UI element 1 of row 2 of outline 1 of scroll area 3 of group 1 of splitter group 1 of group 1 of window 1'
         osascript -e 'tell application "System Events" to tell process "ThreadLight" to keystroke "e" using {command down, shift down}'
         sleep 1
+        osascript -e 'tell application "System Events" to tell process "ThreadLight" to click checkbox "Include evidence signing" of sheet 1 of window 1'
         osascript -e 'tell application "System Events" to tell process "ThreadLight" to click button 2 of group 1 of sheet 1 of window 1'
         sleep 1
         osascript -e 'tell application "System Events" to tell process "ThreadLight" to keystroke "g" using {command down, shift down}'

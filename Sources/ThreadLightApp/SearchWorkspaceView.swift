@@ -6,13 +6,20 @@ import UniformTypeIdentifiers
 struct SearchWorkspaceView: View {
     @Environment(AppModel.self) private var model
     let hold: LegalHold
+    let isLegalHoldListHidden: Bool
+    let showLegalHolds: () -> Void
+    let showsConversationSidebar: Bool
     @State private var isShowingFilters = false
     @State private var isShowingStatusExplanation = false
 
     var body: some View {
         @Bindable var model = model
         VStack(spacing: 0) {
-            HoldHeader(hold: hold)
+            HoldHeader(
+                hold: hold,
+                isLegalHoldListHidden: isLegalHoldListHidden,
+                showLegalHolds: showLegalHolds
+            )
             Divider()
 
             if hold.status != .active {
@@ -25,20 +32,28 @@ struct SearchWorkspaceView: View {
                 } actions: {
                     Button("Why is this blocked?") { isShowingStatusExplanation = true }
                 }
-            } else {
-                SearchBar(isShowingFilters: $isShowingFilters)
-                Divider()
-                if model.messages.isEmpty && !model.isSearching {
-                    EvidenceEmptyState(isSearchEmpty: !model.queryText.isEmpty)
-                } else {
-                    ResultsList()
+            } else if !model.hasImportedPackage {
+                PackageDropZone(hold: hold)
+            } else if showsConversationSidebar {
+                HSplitView {
+                    ConversationSidebar()
+                        .frame(minWidth: 150, idealWidth: 210, maxWidth: 420)
+                    resultsPane
+                        .frame(minWidth: 460)
                 }
+            } else {
+                resultsPane
             }
 
             Divider()
             HStack {
                 if model.isSearching { ProgressView().controlSize(.small) }
                 Text(model.statusMessage).font(.caption).foregroundStyle(.secondary)
+                if model.canLoadMoreMessages {
+                    Button("Load More") { Task { await model.loadMoreMessages() } }
+                        .disabled(model.isSearching)
+                        .accessibilityIdentifier("search.load-more")
+                }
                 Spacer()
                 if !model.selectedMessageIDs.isEmpty {
                     Button("Export \(model.selectedMessageIDs.count) selected") { model.presentExportPanel() }
@@ -48,10 +63,8 @@ struct SearchWorkspaceView: View {
             .padding(.horizontal, 12).padding(.vertical, 8)
             .background(.bar)
         }
-        .navigationTitle(hold.name)
         .background(AmbientBackdrop())
         .sheet(isPresented: $model.isShowingExportOptions) { ExportOptionsSheet() }
-        .popover(isPresented: $isShowingFilters) { FilterPopover() }
         .alert("Slack exports imported", isPresented: $model.isShowingImportReport) {
             Button("OK", role: .cancel) {}
         } message: {
@@ -72,22 +85,35 @@ struct SearchWorkspaceView: View {
         let summary = "\(report.messagesImported) messages imported; \(report.messagesDeduplicated) shared messages deduplicated; \(report.filesReferenced) files referenced."
         return report.warnings.isEmpty ? summary : summary + "\n\n" + report.warnings.joined(separator: "\n")
     }
+
+    private var resultsPane: some View {
+        VStack(spacing: 0) {
+            SearchBar(isShowingFilters: $isShowingFilters)
+            Divider()
+            if model.messages.isEmpty && !model.isSearching {
+                EvidenceEmptyState(isSearchEmpty: !model.queryText.isEmpty || model.searchFilters.conversationID != nil)
+            } else {
+                ResultsList()
+            }
+        }
+    }
 }
 
 private struct ExportOptionsSheet: View {
     @Environment(AppModel.self) private var model
     @Environment(\.dismiss) private var dismiss
     @State private var selectionScope: AppModel.ExportSelectionScope = .completeThreads
-    @State private var fileChoice: FileChoice = .both
+    @State private var fileChoice: FileChoice = .pdf
+    @State private var includeEvidenceSigning = false
 
     private enum FileChoice: String, CaseIterable, Identifiable {
-        case json
         case pdf
+        case json
         case both
 
         var id: String { rawValue }
         var title: String {
-            switch self { case .json: "JSON"; case .pdf: "PDF"; case .both: "JSON + PDF" }
+            switch self { case .pdf: "PDF"; case .json: "JSON"; case .both: "PDF + JSON" }
         }
         var formats: Set<EvidenceExportFormat> {
             switch self { case .json: [.json]; case .pdf: [.pdf]; case .both: [.json, .pdf] }
@@ -97,7 +123,7 @@ private struct ExportOptionsSheet: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 20) {
             VStack(alignment: .leading, spacing: 5) {
-                Label("Create evidence package", systemImage: "checkmark.seal.fill")
+                Label("Export evidence", systemImage: "checkmark.seal.fill")
                     .font(.title2.bold())
                     .foregroundStyle(ThreadLightTheme.accentForeground)
                 Text("ThreadLight rechecks the live hold and every record’s provenance before writing anything.")
@@ -105,17 +131,21 @@ private struct ExportOptionsSheet: View {
             }
 
             GroupBox("Evidence scope") {
-                Picker("Scope", selection: $selectionScope) {
-                    ForEach(AppModel.ExportSelectionScope.allCases) { scope in Text(scope.title).tag(scope) }
+                HStack(alignment: .top, spacing: 24) {
+                    Picker("Scope", selection: $selectionScope) {
+                        ForEach(AppModel.ExportSelectionScope.allCases) { scope in Text(scope.title).tag(scope) }
+                    }
+                    .pickerStyle(.radioGroup)
+                    .labelsHidden()
+                    .frame(width: 190, alignment: .leading)
+
+                    Text(selectionScope == .completeThreads
+                         ? "Includes every in-scope message in each selected thread, even if only one result was checked."
+                         : "Includes only the checked messages.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, minHeight: 42, alignment: .topLeading)
                 }
-                .pickerStyle(.radioGroup)
-                .labelsHidden()
-                Text(selectionScope == .completeThreads
-                     ? "Includes every in-scope message in each selected thread, even if only one result was checked."
-                     : "Includes only the checked messages.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .padding(.top, 5)
             }
 
             GroupBox("Document format") {
@@ -123,10 +153,33 @@ private struct ExportOptionsSheet: View {
                     ForEach(FileChoice.allCases) { choice in Text(choice.title).tag(choice) }
                 }
                 .pickerStyle(.segmented)
-                Text("Available original attachments are included with either format. The signed manifest covers every file.")
+                Text(includeEvidenceSigning
+                     ? "Creates a signed evidence directory. Available original attachments, a manifest, and verification data are included."
+                     : "Exports only the selected PDF or JSON files. Attachments, manifests, and signatures are not included.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .padding(.top, 8)
+                    .frame(maxWidth: .infinity, minHeight: 34, maxHeight: 34, alignment: .topLeading)
+            }
+
+            GroupBox("Evidence signing") {
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack(spacing: 10) {
+                        Toggle("", isOn: $includeEvidenceSigning)
+                            .toggleStyle(.switch)
+                            .labelsHidden()
+                            .fixedSize()
+                        Text("Include evidence signing")
+                        Spacer(minLength: 0)
+                    }
+                    Text(includeEvidenceSigning
+                         ? "ThreadLight will create the complete .threadlight-evidence directory."
+                         : "Off by default. ThreadLight will write individual files directly into the chosen folder.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, minHeight: 32, maxHeight: 32, alignment: .topLeading)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
 
             HStack {
@@ -135,11 +188,17 @@ private struct ExportOptionsSheet: View {
                     .foregroundStyle(.secondary)
                 Spacer()
                 Button("Cancel") { dismiss() }
-                Button("Choose destination…") {
-                    model.chooseExportDestination(selectionScope: selectionScope, formats: fileChoice.formats)
+                    .keyboardShortcut(.cancelAction)
+                Button("Export") {
+                    model.chooseExportDestination(
+                        selectionScope: selectionScope,
+                        formats: fileChoice.formats,
+                        includeEvidenceSigning: includeEvidenceSigning
+                    )
                 }
                 .buttonStyle(.borderedProminent)
                 .tint(ThreadLightTheme.violet)
+                .keyboardShortcut(.defaultAction)
             }
         }
         .padding(24)
@@ -167,17 +226,14 @@ private struct EvidenceEmptyState: View {
                         .offset(x: 38, y: 36)
                 }
             }
-            Text(isSearchEmpty ? "No matches yet" : "Import an encrypted package")
+            Text(isSearchEmpty ? "No matches yet" : "No messages in this package")
                 .font(.title2.bold())
             Text(isSearchEmpty
                  ? "Try fewer terms or adjust the filter chips above."
-                 : "Import the encrypted package for this legal hold to make its messages and attachments searchable.")
+                 : "The imported package does not contain searchable messages.")
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
                 .frame(maxWidth: 420)
-            if !isSearchEmpty {
-                ThreadPathGlyph()
-            }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .padding(32)
@@ -187,57 +243,94 @@ private struct EvidenceEmptyState: View {
 private struct HoldHeader: View {
     @Environment(AppModel.self) private var model
     let hold: LegalHold
+    let isLegalHoldListHidden: Bool
+    let showLegalHolds: () -> Void
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack(alignment: .top) {
-                VStack(alignment: .leading, spacing: 4) {
-                    HStack {
-                        Text(hold.name).font(.title2.bold())
-                        Text(hold.status.rawValue)
-                            .font(.caption.bold())
-                            .foregroundStyle(hold.status == .active ? ThreadLightTheme.successForeground : .secondary)
-                            .padding(.horizontal, 7).padding(.vertical, 3)
-                            .background((hold.status == .active ? ThreadLightTheme.teal : Color.secondary).opacity(0.10), in: Capsule())
-                    }
-                    if !hold.summary.isEmpty { Text(hold.summary).foregroundStyle(.secondary).lineLimit(2) }
-                    Text(windowDescription)
+        HStack(spacing: 12) {
+            if isLegalHoldListHidden {
+                Button(action: showLegalHolds) {
+                    Label("Legal holds", systemImage: "sidebar.left")
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .help("Show the legal hold list")
+            }
+
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 7) {
+                    Text(hold.name)
+                        .font(.headline)
+                        .lineLimit(1)
+                    Text(hold.status.rawValue)
+                        .font(.caption2.bold())
+                        .foregroundStyle(hold.status == .active ? ThreadLightTheme.successForeground : .secondary)
+                        .padding(.horizontal, 6).padding(.vertical, 2)
+                        .background((hold.status == .active ? ThreadLightTheme.teal : Color.secondary).opacity(0.10), in: Capsule())
+                }
+                Text(windowDescription)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+            .help(hold.summary)
+
+            Spacer(minLength: 8)
+
+            if hold.status == .active {
+                if model.custodians.isEmpty {
+                    Label("Custodians unavailable", systemImage: "person.crop.circle.badge.exclamationmark")
                         .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-                Spacer()
-                Button { model.chooseHoldTransferImport() } label: {
-                    Label("Import encrypted package", systemImage: "lock.open")
-                }
-                .buttonStyle(.borderedProminent).tint(ThreadLightTheme.violet)
-                .disabled(hold.status != .active)
-            }
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 8) {
-                    ForEach(model.custodians) { custodian in
-                        Label(custodian.displayName, systemImage: "person.crop.circle")
-                            .font(.caption)
-                            .padding(.horizontal, 9).padding(.vertical, 5)
-                            .foregroundStyle(ThreadLightTheme.accentForeground)
-                            .background(ThreadLightTheme.violet.opacity(0.08), in: Capsule())
-                    }
-                }
-            }
-            if model.custodians.isEmpty {
-                HStack(alignment: .top, spacing: 10) {
-                    Image(systemName: "person.crop.circle.badge.exclamationmark")
                         .foregroundStyle(ThreadLightTheme.dangerForeground)
-                    VStack(alignment: .leading, spacing: 3) {
-                        Text("Custodian list unavailable").font(.callout.bold())
-                        Text("Sign in to Slack again. ThreadLight needs the current member list to open an encrypted package for this hold.")
-                            .font(.caption).foregroundStyle(.secondary)
+                } else {
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 6) {
+                            ForEach(model.custodians) { custodian in
+                                if let name = resolvedName(for: custodian) {
+                                    let profile = model.slackUserProfiles[custodian.id]
+                                    let email = profile?.email ?? custodian.email
+                                    Button {
+                                        NSPasteboard.general.clearContents()
+                                        let identity = [name, "Slack ID: \(custodian.id)", email.map { "Email: \($0)" }]
+                                            .compactMap { $0 }
+                                            .joined(separator: "\n")
+                                        NSPasteboard.general.setString(identity, forType: .string)
+                                    } label: {
+                                        HStack(spacing: 5) {
+                                            SlackAvatar(
+                                                name: name,
+                                                userID: custodian.id,
+                                                url: profile?.avatarURL ?? custodian.avatarURL,
+                                                size: 18
+                                            )
+                                            Text(name)
+                                        }
+                                            .font(.caption2)
+                                            .padding(.horizontal, 7).padding(.vertical, 3)
+                                            .foregroundStyle(ThreadLightTheme.accentForeground)
+                                            .background(ThreadLightTheme.violet.opacity(0.08), in: Capsule())
+                                    }
+                                    .buttonStyle(.plain)
+                                    .help([name, "Slack ID: \(custodian.id)", email.map { "Email: \($0)" }].compactMap { $0 }.joined(separator: "\n"))
+                                    .accessibilityLabel("Copy \(name), Slack ID, and email")
+                                }
+                            }
+                            if unresolvedCustodianCount > 0 {
+                                HStack(spacing: 5) {
+                                    ProgressView().controlSize(.mini)
+                                    Text("Loading \(unresolvedCustodianCount) name\(unresolvedCustodianCount == 1 ? "" : "s")…")
+                                }
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                            }
+                        }
                     }
+                    .frame(minWidth: 120, maxWidth: 300, alignment: .trailing)
                 }
-                .padding(10)
-                .background(ThreadLightTheme.coral.opacity(0.08), in: RoundedRectangle(cornerRadius: 10))
             }
         }
-        .padding(16)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 7)
         .background(
             LinearGradient(
                 colors: [ThreadLightTheme.aubergine.opacity(0.08), ThreadLightTheme.violet.opacity(0.035), .clear],
@@ -250,8 +343,237 @@ private struct HoldHeader: View {
     private var windowDescription: String {
         let start = hold.startAt?.formatted(date: .abbreviated, time: .omitted) ?? "All history"
         let end = hold.endAt?.formatted(date: .abbreviated, time: .omitted) ?? "until release"
-        let restriction = hold.restrictions.contains(.onlyDMs) ? "Direct messages only" : "All covered conversations"
-        return "\(start) – \(end)  •  \(restriction)  •  \(model.custodians.count) custodians"
+        let restriction = hold.restrictions.contains(.onlyDMs) ? "DMs only" : "All conversations"
+        return "\(start) – \(end)  •  \(restriction)"
+    }
+
+    private var unresolvedCustodianCount: Int {
+        model.custodians.count { resolvedName(for: $0) == nil }
+    }
+
+    private func resolvedName(for custodian: Custodian) -> String? {
+        let candidates = [
+            model.slackUserProfiles[custodian.id]?.displayName,
+            custodian.displayName,
+            model.messages.first(where: { $0.senderID == custodian.id })?.senderName,
+        ]
+        return candidates.compactMap { value in
+            let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed?.isEmpty == false && trimmed != custodian.id ? trimmed : nil
+        }.first
+    }
+}
+
+private struct PackageDropZone: View {
+    @Environment(AppModel.self) private var model
+    let hold: LegalHold
+    @State private var isTargeted = false
+    @State private var isImporting = false
+
+    var body: some View {
+        VStack(spacing: 18) {
+            Image(systemName: isImporting ? "lock.rotation" : "shippingbox.and.arrow.backward.fill")
+                .font(.system(size: 48, weight: .medium))
+                .foregroundStyle(ThreadLightTheme.threadGradient)
+            Text(isImporting ? "Importing package…" : "Drag the legal hold package here")
+                .font(.title2.bold())
+            Text("Get the encrypted .threadlight-hold package from your Slack administrator, then drag it anywhere into this area.")
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+                .frame(maxWidth: 460)
+            if isImporting {
+                ProgressView()
+                    .controlSize(.small)
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .padding(36)
+        .background(
+            RoundedRectangle(cornerRadius: 18)
+                .fill(ThreadLightTheme.violet.opacity(isTargeted ? 0.10 : 0.035))
+                .padding(24)
+        )
+        .overlay {
+            RoundedRectangle(cornerRadius: 18)
+                .stroke(
+                    ThreadLightTheme.violet.opacity(isTargeted ? 0.70 : 0.20),
+                    style: StrokeStyle(lineWidth: isTargeted ? 2 : 1, dash: [8, 6])
+                )
+                .padding(24)
+        }
+        .contentShape(Rectangle())
+        .dropDestination(for: URL.self) { urls, _ in
+            guard !isImporting,
+                  let package = urls.first(where: { $0.pathExtension.lowercased() == "threadlight-hold" }) else { return false }
+            isImporting = true
+            Task {
+                await model.importHoldTransfer(from: package)
+                isImporting = false
+            }
+            return true
+        } isTargeted: { isTargeted = $0 }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Drop encrypted package for \(hold.name)")
+    }
+}
+
+private struct ConversationSidebar: View {
+    @Environment(AppModel.self) private var model
+    @Environment(\.openWindow) private var openWindow
+
+    var body: some View {
+        List {
+            Button {
+                model.selectConversation(id: nil)
+            } label: {
+            ConversationSidebarRow(
+                title: "All messages",
+                symbol: "tray.full.fill",
+                count: model.conversations.reduce(0) { $0 + $1.messageCount },
+                isSelected: model.searchFilters.conversationID == nil,
+                avatarProfiles: []
+                )
+            }
+            .buttonStyle(.plain)
+
+            if !directMessages.isEmpty {
+                Section("Direct messages") {
+                    ForEach(directMessages) { conversation in
+                        conversationButton(conversation)
+                    }
+                }
+            }
+
+            if !channels.isEmpty {
+                Section("Channels") {
+                    ForEach(channels) { conversation in
+                        conversationButton(conversation)
+                    }
+                }
+            }
+        }
+        .listStyle(.sidebar)
+        .accessibilityIdentifier("evidence.conversations")
+    }
+
+    @ViewBuilder
+    private func conversationButton(_ conversation: EvidenceConversation) -> some View {
+        Button {
+            model.selectConversation(id: conversation.id)
+        } label: {
+            ConversationSidebarRow(
+                title: conversation.name,
+                symbol: symbol(for: conversation.kind),
+                count: conversation.messageCount,
+                isSelected: model.searchFilters.conversationID == conversation.id,
+                avatarProfiles: conversation.kind.isDirect ? profiles(for: conversation) : []
+            )
+        }
+        .buttonStyle(.plain)
+        .help(helpText(for: conversation))
+        .simultaneousGesture(
+            TapGesture(count: 2).onEnded {
+                guard let holdID = model.selectedHold?.id else { return }
+                openWindow(value: ConversationWindowRequest(holdID: holdID, conversationID: conversation.id))
+            }
+        )
+        .contextMenu {
+            Button("Select all messages") {
+                Task { await model.setEvidenceSelection(for: conversation, selected: true) }
+            }
+            Button("Unselect all messages") {
+                Task { await model.setEvidenceSelection(for: conversation, selected: false) }
+            }
+            Divider()
+            Button("Export this conversation to PDF…") {
+                model.chooseConversationPDFDestination(conversation)
+            }
+        }
+    }
+
+    private var directMessages: [EvidenceConversation] {
+        model.conversations.filter { $0.kind.isDirect }.sorted(by: conversationSort)
+    }
+
+    private var channels: [EvidenceConversation] {
+        model.conversations.filter { !$0.kind.isDirect }.sorted(by: conversationSort)
+    }
+
+    private func conversationSort(_ lhs: EvidenceConversation, _ rhs: EvidenceConversation) -> Bool {
+        lhs.name.localizedCaseInsensitiveCompare(rhs.name) == .orderedAscending
+    }
+
+    private func symbol(for kind: ConversationKind) -> String {
+        switch kind {
+        case .directMessage: "person.fill"
+        case .groupDirectMessage: "person.2.fill"
+        case .publicChannel: "number"
+        case .privateChannel: "lock.fill"
+        case .unknown: "bubble.left.fill"
+        }
+    }
+
+    private func helpText(for conversation: EvidenceConversation) -> String {
+        guard conversation.kind.isDirect else { return "Show messages in \(conversation.name)" }
+        let details = participantNames(for: conversation).map { name in
+            guard let profile = profile(named: name), let email = profile.email else { return name }
+            return "\(name) — \(email)"
+        }
+        return details.isEmpty ? "Direct message" : "Participants:\n" + details.joined(separator: "\n")
+    }
+
+    private func profiles(for conversation: EvidenceConversation) -> [SlackUserProfile] {
+        participantNames(for: conversation).compactMap(profile(named:))
+    }
+
+    private func participantNames(for conversation: EvidenceConversation) -> [String] {
+        conversation.name
+            .split(separator: ",")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+    }
+
+    private func profile(named name: String) -> SlackUserProfile? {
+        model.slackUserProfiles.values.first {
+            $0.displayName.localizedCaseInsensitiveCompare(name) == .orderedSame
+        }
+    }
+}
+
+private struct ConversationSidebarRow: View {
+    let title: String
+    let symbol: String
+    let count: Int
+    let isSelected: Bool
+    let avatarProfiles: [SlackUserProfile]
+
+    var body: some View {
+        HStack(spacing: 7) {
+            Group {
+                if avatarProfiles.isEmpty {
+                    Image(systemName: symbol)
+                } else {
+                    HStack(spacing: -5) {
+                        ForEach(avatarProfiles.prefix(2), id: \.id) { profile in
+                            SlackAvatar(name: profile.displayName, userID: profile.id, url: profile.avatarURL, size: 18)
+                                .overlay(Circle().stroke(.background, lineWidth: 1))
+                        }
+                    }
+                }
+            }
+            .frame(width: 28)
+            Text(title)
+                .lineLimit(1)
+            Spacer(minLength: 4)
+            Text(count.formatted())
+                .font(.caption2.monospacedDigit())
+                .foregroundStyle(.secondary)
+        }
+        .foregroundStyle(isSelected ? ThreadLightTheme.accentForeground : .primary)
+        .padding(.horizontal, 7)
+        .padding(.vertical, 5)
+        .background(isSelected ? ThreadLightTheme.violet.opacity(0.12) : .clear, in: RoundedRectangle(cornerRadius: 7))
+        .contentShape(Rectangle())
     }
 }
 
@@ -269,6 +591,17 @@ private struct SearchBar: View {
                     .onSubmit { Task { await model.search() } }
                     .accessibilityLabel("Search messages")
                     .accessibilityIdentifier("search.query")
+                Button("Search") { Task { await model.search() } }
+                    .buttonStyle(.borderedProminent)
+                    .tint(ThreadLightTheme.violet)
+                    .accessibilityIdentifier("search.submit")
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 8)
+            .background(.background.opacity(0.72), in: RoundedRectangle(cornerRadius: 9))
+            .overlay(RoundedRectangle(cornerRadius: 9).stroke(.secondary.opacity(0.18)))
+
+            HStack(spacing: 8) {
                 Picker("Mode", selection: $model.searchMode) {
                     Text("Basic").tag(SearchMode.basic)
                     Text("Advanced").tag(SearchMode.advanced)
@@ -276,11 +609,53 @@ private struct SearchBar: View {
                 .pickerStyle(.segmented)
                 .labelsHidden()
                 .accessibilityLabel("Search mode")
-                .frame(width: 180)
-                Button { isShowingFilters.toggle() } label: { Label("Filters", systemImage: "line.3.horizontal.decrease.circle") }
-                Button("Search") { Task { await model.search() } }
-                    .buttonStyle(.borderedProminent).tint(ThreadLightTheme.violet)
-                    .accessibilityIdentifier("search.submit")
+                .frame(width: 115)
+                Spacer()
+                Menu {
+                    ForEach(AppModel.MessageSort.allCases) { option in
+                        Button {
+                            model.messageSort = option
+                        } label: {
+                            if option == model.messageSort {
+                                Label(option.title, systemImage: "checkmark")
+                            } else {
+                                Text(option.title)
+                            }
+                        }
+                    }
+                } label: {
+                    Label("Sort", systemImage: "arrow.up.arrow.down")
+                }
+                .menuStyle(.borderlessButton)
+                .fixedSize()
+                .help("Sort messages: \(model.messageSort.title)")
+                Button {
+                    withAnimation(.easeInOut(duration: 0.18)) { isShowingFilters.toggle() }
+                } label: {
+                    HStack(spacing: 5) {
+                        Label("Filters", systemImage: "line.3.horizontal.decrease.circle.fill")
+                        if !filterLabels.isEmpty {
+                            Text(filterLabels.count.formatted())
+                                .font(.caption2.bold())
+                                .padding(.horizontal, 5)
+                                .padding(.vertical, 1)
+                                .background(.white.opacity(0.20), in: Capsule())
+                        }
+                        Image(systemName: isShowingFilters ? "chevron.up" : "chevron.down")
+                            .font(.caption2.bold())
+                    }
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(ThreadLightTheme.violet)
+                .help(isShowingFilters ? "Hide search filters" : "Show search filters")
+                .accessibilityIdentifier("search.filters")
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            if isShowingFilters {
+                FilterPanel {
+                    withAnimation(.easeInOut(duration: 0.18)) { isShowingFilters = false }
+                }
+                .transition(.move(edge: .top).combined(with: .opacity))
             }
             if model.searchMode == .advanced {
                 Text("Supports AND, OR, NOT, parentheses, quoted phrases, NEAR/1…50, and text:/from:/in:/file: fields.")
@@ -307,11 +682,17 @@ private struct SearchBar: View {
         let filters = model.searchFilters
         var labels: [String] = []
         if let sender = filters.sender { labels.append("From: \(sender)") }
+        if let personID = filters.personID,
+           let custodian = model.custodians.first(where: { $0.id == personID }) {
+            labels.append("Person: \(model.slackUserProfiles[personID]?.displayName ?? custodian.displayName)")
+        }
         if let custodianID = filters.custodianID,
            let custodian = model.custodians.first(where: { $0.id == custodianID }) { labels.append("Custodian: \(custodian.displayName)") }
+        if let conversationID = filters.conversationID,
+           let conversation = model.conversations.first(where: { $0.id == conversationID }) { labels.append("In: \(conversation.name)") }
         if let conversation = filters.conversation { labels.append("In: \(conversation)") }
-        if let after = filters.after { labels.append("After: \(after.formatted(date: .numeric, time: .omitted))") }
-        if let before = filters.before { labels.append("Before: \(before.formatted(date: .numeric, time: .omitted))") }
+        if let after = filters.after { labels.append("From date: \(after.formatted(date: .numeric, time: .omitted))") }
+        if let before = filters.before { labels.append("Through date: \(before.addingTimeInterval(-1).formatted(date: .numeric, time: .omitted))") }
         if let kind = filters.kind { labels.append(kind.rawValue) }
         if filters.hasAttachment == true { labels.append("Has attachment") }
         if let fileType = filters.fileType { labels.append("File: \(fileType)") }
@@ -327,14 +708,14 @@ private struct ResultsList: View {
 
     var body: some View {
         List(selection: selection) {
-            ForEach(groupedThreads, id: \.key) { threadID, messages in
+            ForEach(model.messageThreadGroups) { group in
                 Section {
-                    ForEach(messages) { message in
+                    ForEach(group.messages) { message in
                         ResultRow(message: message)
                             .tag(message.id)
                     }
                 } header: {
-                    Text(messages.first.map { "#\($0.conversationName) • \(messages.count) message\(messages.count == 1 ? "" : "s")" } ?? threadID)
+                    Text(group.messages.first.map { "#\($0.conversationName) • \(group.messages.count) message\(group.messages.count == 1 ? "" : "s")" } ?? group.id)
                 }
             }
         }
@@ -346,16 +727,10 @@ private struct ResultsList: View {
         Binding(
             get: { model.selectedMessage?.id },
             set: { id in
-                guard let id, let message = model.messages.first(where: { $0.id == id }) else { return }
+                guard let id, let message = model.message(id: id) else { return }
                 model.selectMessage(message)
             }
         )
-    }
-
-    private var groupedThreads: [(key: String, value: [EvidenceMessage])] {
-        Dictionary(grouping: model.messages, by: \.threadID)
-            .map { ($0.key, $0.value.sorted { $0.postedAt < $1.postedAt }) }
-            .sorted { ($0.1.last?.postedAt ?? .distantPast) > ($1.1.last?.postedAt ?? .distantPast) }
     }
 }
 
@@ -371,10 +746,12 @@ private struct ResultRow: View {
             }
             .buttonStyle(.plain)
             .accessibilityLabel(model.selectedMessageIDs.contains(message.id) ? "Remove message from evidence selection" : "Add message to evidence selection")
-            Circle()
-                .fill(ThreadLightTheme.avatarColor(for: message.senderID).opacity(0.16))
-                .frame(width: 34, height: 34)
-                .overlay(Text(message.senderName.prefix(1).uppercased()).font(.headline).foregroundStyle(.primary))
+            SlackAvatar(
+                name: message.senderName,
+                userID: message.senderID,
+                url: model.slackUserProfiles[message.senderID]?.avatarURL,
+                size: 34
+            )
             VStack(alignment: .leading, spacing: 4) {
                 HStack {
                     Text(message.senderName).fontWeight(.semibold)
@@ -388,6 +765,17 @@ private struct ResultRow: View {
                 )
                     .lineLimit(4)
                     .textSelection(.enabled)
+                if !displayedReactions.isEmpty {
+                    HStack(spacing: 6) {
+                        ForEach(displayedReactions, id: \.self) { reaction in
+                            SlackReactionView(
+                                reaction: reaction,
+                                customEmojiURL: model.slackEmojiURLs[reaction.name],
+                                compact: true
+                            )
+                        }
+                    }
+                }
                 if !message.files.isEmpty {
                     HStack {
                         ForEach(message.files.prefix(3)) { file in
@@ -403,10 +791,19 @@ private struct ResultRow: View {
         .padding(.vertical, 4)
         .accessibilityElement(children: .combine)
         .accessibilityLabel("\(message.senderName), \(message.postedAt.formatted()), \(message.text)")
+        .task(id: message.id) {
+            await model.refreshReactions(for: message)
+        }
+    }
+
+    private var displayedReactions: [EvidenceReaction] {
+        model.liveReactions[message.id] ?? message.reactions ?? []
     }
 }
 
 private struct HighlightedMessageText: View {
+    private static let termRegex = try! NSRegularExpression(pattern: #"\"([^\"]+)\"|([^\s()]+)"#)
+
     let text: String
     let query: String
 
@@ -430,10 +827,8 @@ private struct HighlightedMessageText: View {
     }
 
     private var highlightTerms: [String] {
-        let pattern = #"\"([^\"]+)\"|([^\s()]+)"#
-        guard let regex = try? NSRegularExpression(pattern: pattern) else { return [] }
         let source = query as NSString
-        return regex.matches(in: query, range: NSRange(location: 0, length: source.length)).compactMap { match in
+        return Self.termRegex.matches(in: query, range: NSRange(location: 0, length: source.length)).compactMap { match in
             let quoted = match.range(at: 1)
             if quoted.location != NSNotFound { return source.substring(with: quoted) }
             var token = source.substring(with: match.range(at: 2))
@@ -449,151 +844,214 @@ private struct HighlightedMessageText: View {
     }
 }
 
-private struct FilterPopover: View {
+private struct FilterPanel: View {
     @Environment(AppModel.self) private var model
+    let close: () -> Void
 
     var body: some View {
         @Bindable var model = model
-        Form {
-            TextField("Sender", text: Binding($model.searchFilters.sender, replacingNilWith: ""))
-            Picker("Custodian", selection: $model.searchFilters.custodianID) {
-                Text("Any").tag(String?.none)
-                ForEach(model.custodians) { Text($0.displayName).tag(String?.some($0.id)) }
-            }
-            TextField("Channel or conversation", text: Binding($model.searchFilters.conversation, replacingNilWith: ""))
-            Picker("Conversation type", selection: $model.searchFilters.kind) {
-                Text("Any").tag(ConversationKind?.none)
-                ForEach(ConversationKind.allCases, id: \.self) { Text($0.rawValue).tag(ConversationKind?.some($0)) }
-            }
-            Toggle("After date", isOn: optionalDateToggle($model.searchFilters.after))
-            if model.searchFilters.after != nil {
-                DatePicker("After", selection: optionalDateValue($model.searchFilters.after), displayedComponents: .date)
-            }
-            Toggle("Before date", isOn: optionalDateToggle($model.searchFilters.before))
-            if model.searchFilters.before != nil {
-                DatePicker("Before", selection: optionalDateValue($model.searchFilters.before), displayedComponents: .date)
-            }
-            Toggle("Has attachment", isOn: Binding($model.searchFilters.hasAttachment, replacingNilWith: false))
-            TextField("File type (for example PDF)", text: Binding($model.searchFilters.fileType, replacingNilWith: ""))
-            Toggle("Thread replies only", isOn: Binding($model.searchFilters.isThread, replacingNilWith: false))
-            Toggle("Edited", isOn: Binding($model.searchFilters.isEdited, replacingNilWith: false))
-            Toggle("Deleted", isOn: Binding($model.searchFilters.isDeleted, replacingNilWith: false))
-            HStack {
-                Button("Clear") { model.searchFilters = .init() }
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 10) {
+                Label("Filter messages", systemImage: "line.3.horizontal.decrease.circle.fill")
+                    .font(.headline)
+                    .foregroundStyle(ThreadLightTheme.accentForeground)
+                if activeFilterCount > 0 {
+                    Text("\(activeFilterCount) active")
+                        .font(.caption2.bold())
+                        .foregroundStyle(ThreadLightTheme.accentForeground)
+                        .padding(.horizontal, 7)
+                        .padding(.vertical, 3)
+                        .background(ThreadLightTheme.violet.opacity(0.11), in: Capsule())
+                }
                 Spacer()
-                Button("Apply") { Task { await model.search() } }.buttonStyle(.borderedProminent).tint(ThreadLightTheme.violet)
+                Button("Clear", systemImage: "xmark.circle") {
+                    model.searchFilters = .init()
+                    Task { await model.search() }
+                }
+                .disabled(activeFilterCount == 0 || model.isSearching)
+                Button {
+                    close()
+                    Task { await model.search() }
+                } label: {
+                    if model.isSearching {
+                        ProgressView().controlSize(.small)
+                    } else {
+                        Label("Apply Filters", systemImage: "checkmark")
+                    }
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(ThreadLightTheme.violet)
+                .disabled(model.isSearching)
+            }
+
+            Divider()
+
+            Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 10) {
+                GridRow {
+                    filterField("Person involved", detail: "Author or @mention") {
+                        Picker("Person involved", selection: $model.searchFilters.personID) {
+                            Text("Any person").tag(String?.none)
+                            ForEach(model.custodians) { custodian in
+                                Text(model.slackUserProfiles[custodian.id]?.displayName ?? custodian.displayName)
+                                    .tag(String?.some(custodian.id))
+                            }
+                        }
+                        .labelsHidden()
+                    }
+                    filterField("Conversation type") {
+                        Picker("Conversation type", selection: $model.searchFilters.kind) {
+                            Text("Any type").tag(ConversationKind?.none)
+                            ForEach(ConversationKind.allCases, id: \.self) {
+                                Text($0.rawValue).tag(ConversationKind?.some($0))
+                            }
+                        }
+                        .labelsHidden()
+                    }
+                }
+                GridRow {
+                    filterField("Sender name") {
+                        TextField("Any sender", text: Binding($model.searchFilters.sender, replacingNilWith: ""))
+                            .textFieldStyle(.roundedBorder)
+                    }
+                    filterField("Channel or conversation") {
+                        TextField("Any conversation", text: Binding($model.searchFilters.conversation, replacingNilWith: ""))
+                            .textFieldStyle(.roundedBorder)
+                    }
+                }
+                GridRow {
+                    filterField("Evidence custodian") {
+                        Picker("Evidence custodian", selection: $model.searchFilters.custodianID) {
+                            Text("Any custodian").tag(String?.none)
+                            ForEach(model.custodians) { Text($0.displayName).tag(String?.some($0.id)) }
+                        }
+                        .labelsHidden()
+                    }
+                    filterField("File type") {
+                        TextField("For example, PDF", text: Binding($model.searchFilters.fileType, replacingNilWith: ""))
+                            .textFieldStyle(.roundedBorder)
+                    }
+                }
+            }
+
+            Divider()
+
+            VStack(alignment: .leading, spacing: 9) {
+                Toggle("Between specific days", isOn: dateRangeEnabled)
+                    .toggleStyle(.switch)
+                if model.searchFilters.after != nil, model.searchFilters.before != nil {
+                    HStack(alignment: .top, spacing: 24) {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("From date")
+                                .font(.caption.weight(.semibold))
+                            DatePicker("From date", selection: fromDate, displayedComponents: .date)
+                                .labelsHidden()
+                        }
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("Through date")
+                                .font(.caption.weight(.semibold))
+                            DatePicker("Through date", selection: throughDate, displayedComponents: .date)
+                                .labelsHidden()
+                        }
+                        Spacer(minLength: 0)
+                    }
+                }
+            }
+
+            HStack(spacing: 18) {
+                Toggle("Has attachment", isOn: enabledFilter($model.searchFilters.hasAttachment))
+                Toggle("Thread replies", isOn: enabledFilter($model.searchFilters.isThread))
+                Toggle("Edited", isOn: enabledFilter($model.searchFilters.isEdited))
+                Toggle("Deleted", isOn: enabledFilter($model.searchFilters.isDeleted))
+                Spacer(minLength: 0)
             }
         }
-        .padding().frame(width: 360)
+        .font(.callout)
+        .padding(14)
+        .threadLightCard(emphasis: activeFilterCount > 0)
+        .accessibilityIdentifier("search.filter-panel")
     }
 
-    private func optionalDateToggle(_ date: Binding<Date?>) -> Binding<Bool> {
+    @ViewBuilder
+    private func filterField<Content: View>(
+        _ title: String,
+        detail: String? = nil,
+        @ViewBuilder content: () -> Content
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 5) {
+                Text(title).font(.caption.weight(.semibold))
+                if let detail {
+                    Text(detail).font(.caption2).foregroundStyle(.secondary)
+                }
+            }
+            content()
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private var activeFilterCount: Int {
+        let filters = model.searchFilters
+        return [
+            filters.sender != nil,
+            filters.personID != nil,
+            filters.custodianID != nil,
+            filters.conversationID != nil,
+            filters.conversation != nil,
+            filters.after != nil || filters.before != nil,
+            filters.kind != nil,
+            filters.hasAttachment == true,
+            filters.fileType != nil,
+            filters.isThread == true,
+            filters.isEdited == true,
+            filters.isDeleted == true,
+        ].count(where: { $0 })
+    }
+
+    private func enabledFilter(_ value: Binding<Bool?>) -> Binding<Bool> {
         Binding(
-            get: { date.wrappedValue != nil },
-            set: { date.wrappedValue = $0 ? Calendar.current.startOfDay(for: .now) : nil }
+            get: { value.wrappedValue == true },
+            set: { value.wrappedValue = $0 ? true : nil }
         )
     }
 
-    private func optionalDateValue(_ date: Binding<Date?>) -> Binding<Date> {
-        Binding(get: { date.wrappedValue ?? .now }, set: { date.wrappedValue = $0 })
-    }
-}
-
-struct HoldArchiveIntakeSheet: View {
-    @Environment(AppModel.self) private var model
-    @Environment(\.dismiss) private var dismiss
-    let hold: LegalHold
-    @State private var archiveURLs: [URL] = []
-    @State private var operatorBinding = NSFullUserName()
-    @State private var importing = false
-    @State private var importTask: Task<Void, Never>?
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 18) {
-            Text("Attach Slack exports to this hold").font(.title2.bold())
-            Text(hold.name).font(.headline)
-            if !hold.summary.isEmpty {
-                Text(hold.summary).foregroundStyle(.secondary)
-            }
-            GroupBox {
-                VStack(spacing: 10) {
-                    Image(systemName: "square.and.arrow.down.on.square")
-                        .font(.system(size: 34))
-                        .foregroundStyle(ThreadLightTheme.accentForeground)
-                    Text("Drop one or more ZIP files here").font(.headline)
-                    Text("or").font(.caption).foregroundStyle(.secondary)
-                    Button("Choose ZIP files…", action: chooseArchives)
+    private var dateRangeEnabled: Binding<Bool> {
+        Binding(
+            get: { model.searchFilters.after != nil && model.searchFilters.before != nil },
+            set: { enabled in
+                if enabled {
+                    let calendar = Calendar.current
+                    let today = calendar.startOfDay(for: .now)
+                    model.searchFilters.after = calendar.date(byAdding: .month, value: -1, to: today) ?? today
+                    model.searchFilters.before = calendar.date(byAdding: .day, value: 1, to: today)
+                } else {
+                    model.searchFilters.after = nil
+                    model.searchFilters.before = nil
                 }
-                .frame(maxWidth: .infinity, minHeight: 125)
             }
-            .dropDestination(for: URL.self) { urls, _ in
-                add(urls)
-                return !urls.isEmpty
-            }
-            if !archiveURLs.isEmpty {
-                List(archiveURLs, id: \.path) { url in
-                    HStack {
-                        Image(systemName: "doc.zipper")
-                        Text(url.lastPathComponent).lineLimit(1)
-                        Spacer()
-                        Button("Remove", systemImage: "xmark") {
-                            archiveURLs.removeAll { $0 == url }
-                        }
-                        .labelStyle(.iconOnly)
-                    }
-                }
-                .frame(height: min(CGFloat(archiveURLs.count * 32 + 8), 150))
-            }
-            TextField("Imported by", text: $operatorBinding)
-            HStack {
-                Button(importing ? "Cancel import" : "Cancel") {
-                    importTask?.cancel()
-                    if !importing { dismiss() }
-                }
-                Spacer()
-                Button("Import \(archiveURLs.count) ZIP file(s)") {
-                    importing = true
-                    importTask = Task {
-                        await model.importHoldArchives(urls: archiveURLs, operatorBinding: operatorBinding)
-                        importing = false
-                        dismiss()
-                    }
-                }
-                .buttonStyle(.borderedProminent).tint(ThreadLightTheme.violet)
-                .disabled(archiveURLs.isEmpty || operatorBinding.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || importing)
-            }
-            if importing {
-                ProgressView("Validating, normalizing, and encrypting local evidence…")
-            }
-        }
-        .padding(24)
-        .frame(minWidth: 650, idealWidth: 650, maxWidth: 650, minHeight: 440)
-        .onDisappear { importTask?.cancel() }
+        )
     }
 
-    private func chooseArchives() {
-        let panel = NSOpenPanel()
-        panel.allowedContentTypes = [.zip]
-        panel.allowsMultipleSelection = true
-        panel.canChooseDirectories = false
-        if panel.runModal() == .OK { add(panel.urls) }
+    private var fromDate: Binding<Date> {
+        Binding(
+            get: { model.searchFilters.after ?? .now },
+            set: { model.searchFilters.after = Calendar.current.startOfDay(for: $0) }
+        )
     }
 
-    private func add(_ urls: [URL]) {
-        let zips = urls.filter { $0.pathExtension.lowercased() == "zip" }
-        let existing = Set(archiveURLs.map(\.standardizedFileURL))
-        archiveURLs.append(contentsOf: zips.filter { !existing.contains($0.standardizedFileURL) })
+    private var throughDate: Binding<Date> {
+        Binding(
+            get: { (model.searchFilters.before ?? .now).addingTimeInterval(-1) },
+            set: {
+                let start = Calendar.current.startOfDay(for: $0)
+                model.searchFilters.before = Calendar.current.date(byAdding: .day, value: 1, to: start)
+            }
+        )
     }
 }
 
 private extension Binding where Value == String {
     init(_ source: Binding<String?>, replacingNilWith fallback: String) {
         self.init(get: { source.wrappedValue ?? fallback }, set: { source.wrappedValue = $0.isEmpty ? nil : $0 })
-    }
-}
-
-private extension Binding where Value == Bool {
-    init(_ source: Binding<Bool?>, replacingNilWith fallback: Bool) {
-        self.init(get: { source.wrappedValue ?? fallback }, set: { source.wrappedValue = $0 })
     }
 }

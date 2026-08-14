@@ -1,6 +1,7 @@
 import AppKit
 import CoreText
 import Foundation
+import PDFKit
 
 public struct EvidenceManifest: Codable, Sendable {
     public struct HoldSummary: Codable, Sendable {
@@ -46,6 +47,10 @@ public struct EvidenceExportResult: Sendable {
     public let keyID: String
 }
 
+public struct EvidenceFileExportResult: Sendable {
+    public let fileURLs: [URL]
+}
+
 public struct EvidenceExporter: Sendable {
     private let store: EvidenceStore
     private let signer: any SignatureProvider
@@ -72,79 +77,7 @@ public struct EvidenceExporter: Sendable {
         destination: URL,
         formats: Set<EvidenceExportFormat> = [.json, .pdf]
     ) async throws -> EvidenceExportResult {
-        guard hold.status == .active else { throw ThreadLightError.export("Only a hold confirmed ACTIVE by Slack can be exported.") }
-        guard !messages.isEmpty else { throw ThreadLightError.export("Select at least one message to export.") }
-        guard messages.count <= 50_000 else { throw ThreadLightError.export("Split this review into evidence packages of 50,000 messages or fewer.") }
-        guard !formats.isEmpty else { throw ThreadLightError.export("Choose JSON, PDF, or both evidence formats.") }
-
-        var items: [EvidenceManifest.Item] = []
-        var sources: [UUID: SourceArchive] = [:]
-        var warnings: [String] = []
-        for message in messages {
-            let memberships = try await store.memberships(messageID: message.id, holdID: hold.id)
-            var accepted: [(HoldMembership, SourceArchive)] = []
-            var lastBlocked: ScopeDecision?
-            for membership in memberships {
-                let archive = try await store.sourceArchive(id: membership.sourceArchiveID)
-                let custodian = custodians.first { $0.id == membership.custodianID && $0.holdID == hold.id }
-                let decision = ScopeEvaluator.evaluate(message: message, hold: hold, custodian: custodian, archive: archive, membership: membership)
-                if decision.canExport, let archive { accepted.append((membership, archive)) }
-                else { lastBlocked = decision }
-            }
-            guard !accepted.isEmpty else {
-                if case let .blocked(_, detail) = lastBlocked { throw ThreadLightError.scope("Message \(message.id) is not exportable: \(detail)") }
-                throw ThreadLightError.scope("Message \(message.id) has no unambiguous hold membership.")
-            }
-            guard items.count + accepted.count <= 100_000 else {
-                throw ThreadLightError.export("The selected messages have more than 100,000 custodian/source relationships. Split the evidence export into smaller packages.")
-            }
-            let consistency = ScopeEvaluator.evaluateSourceConsistency(accepted.map(\.0))
-            guard consistency.canExport else {
-                if case let .blocked(_, detail) = consistency {
-                    throw ThreadLightError.scope("Message \(message.id) is not exportable: \(detail)")
-                }
-                throw ThreadLightError.scope("Message \(message.id) has conflicting source records.")
-            }
-            let fallbackRaw = message.rawJSON.isEmpty ? try CanonicalJSON.encode(message) : message.rawJSON
-            for relation in accepted {
-                sources[relation.1.id] = relation.1
-                items.append(.init(
-                    messageID: message.id,
-                    conversationID: message.conversationID,
-                    threadID: message.threadID,
-                    postedAt: message.postedAt,
-                    sha256: relation.0.sourceMessageSHA256.isEmpty
-                        ? SHA256Digest.data(fallbackRaw)
-                        : relation.0.sourceMessageSHA256,
-                    sourceArchiveID: relation.0.sourceArchiveID,
-                    custodianID: relation.0.custodianID
-                ))
-            }
-            for file in message.files where !file.hasOriginalBytes {
-                warnings.append("Original bytes unavailable for \(file.name) (Slack file \(file.id)); exported metadata only.")
-            }
-        }
-
-        for source in sources.values {
-            if let holdStart = hold.startAt {
-                if let coverageStart = source.coverageStart {
-                    if coverageStart > holdStart {
-                        warnings.append("Source \(source.originalFilename) begins after the hold start; earlier content may be missing.")
-                    }
-                } else {
-                    warnings.append("Source \(source.originalFilename) has no provable start-date coverage.")
-                }
-            }
-            if let holdEnd = hold.endAt {
-                if let coverageEnd = source.coverageEnd {
-                    if coverageEnd < holdEnd {
-                        warnings.append("Source \(source.originalFilename) ends before the hold end; later content may be missing.")
-                    }
-                } else {
-                    warnings.append("Source \(source.originalFilename) has no provable end-date coverage.")
-                }
-            }
-        }
+        let prepared = try await prepare(messages: messages, hold: hold, custodians: custodians, formats: formats)
 
         let exportID = UUID()
         let packageURL = destination.appending(path: "ThreadLight-\(Self.safeFilename(hold.name))-\(exportID.uuidString.prefix(8)).threadlight-evidence", directoryHint: .isDirectory)
@@ -207,10 +140,10 @@ public struct EvidenceExporter: Sendable {
                     endAt: hold.endAt,
                     restrictions: hold.restrictions.sorted { $0.rawValue < $1.rawValue }
                 ),
-                items: items.sorted { $0.messageID < $1.messageID },
-                sources: sources.values.sorted { $0.id.uuidString < $1.id.uuidString },
+                items: prepared.items.sorted { $0.messageID < $1.messageID },
+                sources: prepared.sources.values.sorted { $0.id.uuidString < $1.id.uuidString },
                 files: payloadFiles.sorted { $0.path < $1.path },
-                warnings: Array(Set(warnings)).sorted()
+                warnings: Array(Set(prepared.warnings)).sorted()
             )
             let manifestData = try CanonicalJSON.encode(manifest)
             let manifestURL = packageURL.appending(path: "manifest.json")
@@ -229,6 +162,219 @@ public struct EvidenceExporter: Sendable {
             try? FileManager.default.removeItem(at: packageURL)
             throw error
         }
+    }
+
+    public func exportFiles(
+        messages: [EvidenceMessage],
+        hold: LegalHold,
+        custodians: [Custodian],
+        destination: URL,
+        formats: Set<EvidenceExportFormat> = [.pdf]
+    ) async throws -> EvidenceFileExportResult {
+        _ = try await prepare(messages: messages, hold: hold, custodians: custodians, formats: formats)
+        let destinationValues = try destination.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+        guard destinationValues.isDirectory == true, destinationValues.isSymbolicLink != true else {
+            throw ThreadLightError.export("Choose a regular folder for the exported evidence files.")
+        }
+
+        let exportID = UUID().uuidString.prefix(8)
+        let basename = "ThreadLight-\(Self.safeFilename(hold.name))-\(exportID)"
+        var targets: [(EvidenceExportFormat, URL)] = []
+        if formats.contains(.pdf) { targets.append((.pdf, destination.appending(path: basename + ".pdf"))) }
+        if formats.contains(.json) { targets.append((.json, destination.appending(path: basename + ".json"))) }
+        guard targets.allSatisfy({ !FileManager.default.fileExists(atPath: $0.1.path) }) else {
+            throw ThreadLightError.export("An evidence file with this export name already exists.")
+        }
+
+        var written: [URL] = []
+        do {
+            for (format, url) in targets {
+                switch format {
+                case .json:
+                    let evidence = EvidenceDocument(schemaVersion: 1, hold: hold, messages: messages)
+                    let data = try CanonicalJSON.encode(evidence)
+                    try data.write(to: url, options: [.atomic, .completeFileProtection])
+                    written.append(url)
+                    let decoded = try CanonicalJSON.decoder.decode(EvidenceDocument.self, from: Data(contentsOf: url))
+                    guard try CanonicalJSON.encode(decoded) == data else {
+                        throw ThreadLightError.export("The new JSON evidence file failed its post-write verification.")
+                    }
+                case .pdf:
+                    try PDFRenderer.render(messages: messages, hold: hold, to: url, includesAttachmentBytes: false)
+                    written.append(url)
+                    guard let document = PDFDocument(url: url), document.pageCount > 0 else {
+                        throw ThreadLightError.export("The new PDF evidence file failed its post-write verification.")
+                    }
+                }
+            }
+            return .init(fileURLs: written)
+        } catch {
+            for url in written { try? FileManager.default.removeItem(at: url) }
+            throw error
+        }
+    }
+
+    public func exportPDF(
+        messages: [EvidenceMessage],
+        hold: LegalHold,
+        custodians: [Custodian],
+        destination: URL
+    ) async throws -> URL {
+        _ = try await prepare(messages: messages, hold: hold, custodians: custodians, formats: [.pdf])
+        let folder = destination.deletingLastPathComponent()
+        let folderValues = try folder.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+        guard folderValues.isDirectory == true, folderValues.isSymbolicLink != true else {
+            throw ThreadLightError.export("Choose a regular folder for the PDF evidence file.")
+        }
+        if FileManager.default.fileExists(atPath: destination.path) {
+            guard try Self.isRegularNonSymlink(destination) else {
+                throw ThreadLightError.export("The selected PDF destination is not a regular file.")
+            }
+        }
+
+        let temporary = FileManager.default.temporaryDirectory.appending(path: "ThreadLight-\(UUID().uuidString).pdf")
+        do {
+            try PDFRenderer.render(messages: messages, hold: hold, to: temporary, includesAttachmentBytes: false)
+            guard let document = PDFDocument(url: temporary), document.pageCount > 0 else {
+                throw ThreadLightError.export("The new PDF evidence file failed its post-write verification.")
+            }
+            if FileManager.default.fileExists(atPath: destination.path) {
+                _ = try FileManager.default.replaceItemAt(destination, withItemAt: temporary)
+            } else {
+                try FileManager.default.moveItem(at: temporary, to: destination)
+            }
+            return destination
+        } catch {
+            try? FileManager.default.removeItem(at: temporary)
+            throw error
+        }
+    }
+
+    public func exportJSON(
+        messages: [EvidenceMessage],
+        hold: LegalHold,
+        custodians: [Custodian],
+        destination: URL
+    ) async throws -> URL {
+        _ = try await prepare(messages: messages, hold: hold, custodians: custodians, formats: [.json])
+        let folder = destination.deletingLastPathComponent()
+        let folderValues = try folder.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+        guard folderValues.isDirectory == true, folderValues.isSymbolicLink != true else {
+            throw ThreadLightError.export("Choose a regular folder for the JSON evidence file.")
+        }
+        if FileManager.default.fileExists(atPath: destination.path) {
+            guard try Self.isRegularNonSymlink(destination) else {
+                throw ThreadLightError.export("The selected JSON destination is not a regular file.")
+            }
+        }
+
+        let temporary = FileManager.default.temporaryDirectory.appending(path: "ThreadLight-\(UUID().uuidString).json")
+        do {
+            let evidence = EvidenceDocument(schemaVersion: 1, hold: hold, messages: messages)
+            let data = try CanonicalJSON.encode(evidence)
+            try data.write(to: temporary, options: [.atomic, .completeFileProtection])
+            let decoded = try CanonicalJSON.decoder.decode(EvidenceDocument.self, from: Data(contentsOf: temporary))
+            guard try CanonicalJSON.encode(decoded) == data else {
+                throw ThreadLightError.export("The new JSON evidence file failed its post-write verification.")
+            }
+            if FileManager.default.fileExists(atPath: destination.path) {
+                _ = try FileManager.default.replaceItemAt(destination, withItemAt: temporary)
+            } else {
+                try FileManager.default.moveItem(at: temporary, to: destination)
+            }
+            return destination
+        } catch {
+            try? FileManager.default.removeItem(at: temporary)
+            throw error
+        }
+    }
+
+    private struct PreparedExport {
+        var items: [EvidenceManifest.Item]
+        var sources: [UUID: SourceArchive]
+        var warnings: [String]
+    }
+
+    private func prepare(
+        messages: [EvidenceMessage],
+        hold: LegalHold,
+        custodians: [Custodian],
+        formats: Set<EvidenceExportFormat>
+    ) async throws -> PreparedExport {
+        guard hold.status == .active else { throw ThreadLightError.export("Only a hold confirmed ACTIVE by Slack can be exported.") }
+        guard !messages.isEmpty else { throw ThreadLightError.export("Select at least one message to export.") }
+        guard messages.count <= 50_000 else { throw ThreadLightError.export("Split this review into exports of 50,000 messages or fewer.") }
+        guard !formats.isEmpty else { throw ThreadLightError.export("Choose JSON, PDF, or both evidence formats.") }
+
+        var items: [EvidenceManifest.Item] = []
+        var sources: [UUID: SourceArchive] = [:]
+        var warnings: [String] = []
+        for message in messages {
+            let memberships = try await store.memberships(messageID: message.id, holdID: hold.id)
+            var accepted: [(HoldMembership, SourceArchive)] = []
+            var lastBlocked: ScopeDecision?
+            for membership in memberships {
+                let archive = try await store.sourceArchive(id: membership.sourceArchiveID)
+                let custodian = custodians.first { $0.id == membership.custodianID && $0.holdID == hold.id }
+                let decision = ScopeEvaluator.evaluate(message: message, hold: hold, custodian: custodian, archive: archive, membership: membership)
+                if decision.canExport, let archive { accepted.append((membership, archive)) }
+                else { lastBlocked = decision }
+            }
+            guard !accepted.isEmpty else {
+                if case let .blocked(_, detail) = lastBlocked { throw ThreadLightError.scope("Message \(message.id) is not exportable: \(detail)") }
+                throw ThreadLightError.scope("Message \(message.id) has no unambiguous hold membership.")
+            }
+            guard items.count + accepted.count <= 100_000 else {
+                throw ThreadLightError.export("The selected messages have more than 100,000 custodian/source relationships. Split the evidence export into smaller exports.")
+            }
+            let consistency = ScopeEvaluator.evaluateSourceConsistency(accepted.map(\.0))
+            guard consistency.canExport else {
+                if case let .blocked(_, detail) = consistency {
+                    throw ThreadLightError.scope("Message \(message.id) is not exportable: \(detail)")
+                }
+                throw ThreadLightError.scope("Message \(message.id) has conflicting source records.")
+            }
+            let fallbackRaw = message.rawJSON.isEmpty ? try CanonicalJSON.encode(message) : message.rawJSON
+            for relation in accepted {
+                sources[relation.1.id] = relation.1
+                items.append(.init(
+                    messageID: message.id,
+                    conversationID: message.conversationID,
+                    threadID: message.threadID,
+                    postedAt: message.postedAt,
+                    sha256: relation.0.sourceMessageSHA256.isEmpty
+                        ? SHA256Digest.data(fallbackRaw)
+                        : relation.0.sourceMessageSHA256,
+                    sourceArchiveID: relation.0.sourceArchiveID,
+                    custodianID: relation.0.custodianID
+                ))
+            }
+            for file in message.files where !file.hasOriginalBytes {
+                warnings.append("Original bytes unavailable for \(file.name) (Slack file \(file.id)); exported metadata only.")
+            }
+        }
+
+        for source in sources.values {
+            if let holdStart = hold.startAt {
+                if let coverageStart = source.coverageStart {
+                    if coverageStart > holdStart {
+                        warnings.append("Source \(source.originalFilename) begins after the hold start; earlier content may be missing.")
+                    }
+                } else {
+                    warnings.append("Source \(source.originalFilename) has no provable start-date coverage.")
+                }
+            }
+            if let holdEnd = hold.endAt {
+                if let coverageEnd = source.coverageEnd {
+                    if coverageEnd < holdEnd {
+                        warnings.append("Source \(source.originalFilename) ends before the hold end; later content may be missing.")
+                    }
+                } else {
+                    warnings.append("Source \(source.originalFilename) has no provable end-date coverage.")
+                }
+            }
+        }
+        return .init(items: items, sources: sources, warnings: warnings)
     }
 
     public static func verify(packageURL: URL) throws -> Bool {
@@ -276,9 +422,12 @@ public struct EvidenceExporter: Sendable {
         guard Set(sourceIDs).count == sourceIDs.count else { return false }
         let sources = Dictionary(uniqueKeysWithValues: manifest.sources.map { ($0.id, $0) })
         for source in manifest.sources {
+            let validSourceBinding = source.isPerCustodian
+                ? source.custodianID != "threadlight:hold-wide"
+                : source.custodianID == "threadlight:hold-wide"
             guard source.holdID == manifest.hold.id,
-                  source.isPerCustodian,
                   !source.custodianID.isEmpty,
+                  validSourceBinding,
                   !source.operatorBinding.isEmpty,
                   validSHA256(source.sha256),
                   source.coverageStart.map({ start in source.coverageEnd.map { start <= $0 } ?? true }) ?? true else {
@@ -414,12 +563,22 @@ public enum CanonicalJSON {
 }
 
 enum PDFRenderer {
+    private static let pageColor = NSColor.white
+    private static let primaryInk = NSColor(calibratedWhite: 0.10, alpha: 1)
+    private static let secondaryInk = NSColor(calibratedWhite: 0.38, alpha: 1)
+    private static let ruleInk = NSColor(calibratedWhite: 0.82, alpha: 1)
+
     private struct Page {
         let content: NSAttributedString
         let range: CFRange
     }
 
-    static func render(messages: [EvidenceMessage], hold: LegalHold, to url: URL) throws {
+    static func render(
+        messages: [EvidenceMessage],
+        hold: LegalHold,
+        to url: URL,
+        includesAttachmentBytes: Bool = true
+    ) throws {
         var mediaBox = CGRect(x: 0, y: 0, width: 612, height: 792)
         guard let context = CGContext(url as CFURL, mediaBox: &mediaBox, nil) else {
             throw ThreadLightError.export("Could not create the PDF evidence document.")
@@ -427,7 +586,7 @@ enum PDFRenderer {
         let contentRect = CGRect(x: 54, y: 58, width: 504, height: 680)
         var pages: [Page] = []
         for message in messages {
-            let content = content(for: message, hold: hold)
+            let content = content(for: message, hold: hold, includesAttachmentBytes: includesAttachmentBytes)
             let framesetter = CTFramesetterCreateWithAttributedString(content)
             var location = 0
             while location < content.length {
@@ -445,10 +604,17 @@ enum PDFRenderer {
 
         for (index, page) in pages.enumerated() {
             context.beginPDFPage(nil)
+            context.setFillColor(pageColor.cgColor)
+            context.fill(mediaBox)
             let framesetter = CTFramesetterCreateWithAttributedString(page.content)
             let frame = CTFramesetterCreateFrame(framesetter, page.range, CGPath(rect: contentRect, transform: nil), nil)
             CTFrameDraw(frame, context)
-            let footer = NSAttributedString(string: "ThreadLight • Page \(index + 1) of \(pages.count)", attributes: [.font: NSFont.systemFont(ofSize: 8), .foregroundColor: NSColor.secondaryLabelColor])
+            context.setStrokeColor(ruleInk.cgColor)
+            context.setLineWidth(0.5)
+            context.move(to: CGPoint(x: 54, y: 50))
+            context.addLine(to: CGPoint(x: 558, y: 50))
+            context.strokePath()
+            let footer = NSAttributedString(string: "ThreadLight • Page \(index + 1) of \(pages.count)", attributes: [.font: NSFont.systemFont(ofSize: 8), .foregroundColor: secondaryInk])
             let footerSetter = CTFramesetterCreateWithAttributedString(footer)
             CTFrameDraw(CTFramesetterCreateFrame(footerSetter, CFRange(), CGPath(rect: CGRect(x: 54, y: 30, width: 504, height: 16), transform: nil), nil), context)
             context.endPDFPage()
@@ -456,22 +622,27 @@ enum PDFRenderer {
         context.closePDF()
     }
 
-    private static func content(for message: EvidenceMessage, hold: LegalHold) -> NSAttributedString {
+    private static func content(
+        for message: EvidenceMessage,
+        hold: LegalHold,
+        includesAttachmentBytes: Bool
+    ) -> NSAttributedString {
         let content = NSMutableAttributedString()
-        content.append(.init(string: hold.name + "\n", attributes: [.font: NSFont.systemFont(ofSize: 18, weight: .semibold), .foregroundColor: NSColor.labelColor]))
-        content.append(.init(string: "#\(message.conversationName)  •  \(message.postedAt.formatted(date: .abbreviated, time: .standard))\n\n", attributes: [.font: NSFont.systemFont(ofSize: 10), .foregroundColor: NSColor.secondaryLabelColor]))
-        content.append(.init(string: message.senderName + "\n", attributes: [.font: NSFont.systemFont(ofSize: 12, weight: .semibold), .foregroundColor: NSColor.labelColor]))
-        content.append(.init(string: message.text + "\n\n", attributes: [.font: NSFont.systemFont(ofSize: 11), .foregroundColor: NSColor.labelColor]))
+        content.append(.init(string: hold.name + "\n", attributes: [.font: NSFont.systemFont(ofSize: 18, weight: .semibold), .foregroundColor: primaryInk]))
+        content.append(.init(string: "#\(message.conversationName)  •  \(message.postedAt.formatted(date: .abbreviated, time: .standard))\n\n", attributes: [.font: NSFont.systemFont(ofSize: 10), .foregroundColor: secondaryInk]))
+        content.append(.init(string: message.senderName + "\n", attributes: [.font: NSFont.systemFont(ofSize: 12, weight: .semibold), .foregroundColor: primaryInk]))
+        content.append(.init(string: message.text + "\n\n", attributes: [.font: NSFont.systemFont(ofSize: 11), .foregroundColor: primaryInk]))
         if let reactions = message.reactions, !reactions.isEmpty {
-            content.append(.init(string: "Reactions: " + reactions.map { ":\($0.name): \($0.count)" }.joined(separator: "  ") + "\n\n", attributes: [.font: NSFont.systemFont(ofSize: 9)]))
+            content.append(.init(string: "Reactions: " + reactions.map { ":\($0.name): \($0.count)" }.joined(separator: "  ") + "\n\n", attributes: [.font: NSFont.systemFont(ofSize: 9), .foregroundColor: secondaryInk]))
         }
         if !message.files.isEmpty {
-            content.append(.init(string: "Attachments\n", attributes: [.font: NSFont.systemFont(ofSize: 11, weight: .semibold)]))
+            content.append(.init(string: "Attachments\n", attributes: [.font: NSFont.systemFont(ofSize: 11, weight: .semibold), .foregroundColor: primaryInk]))
             for file in message.files {
-                content.append(.init(string: "• \(file.name) — \(file.mimeType ?? "unknown type") — \(file.hasOriginalBytes ? "included" : "metadata only")\n", attributes: [.font: NSFont.systemFont(ofSize: 9)]))
+                let availability = includesAttachmentBytes && file.hasOriginalBytes ? "included" : "metadata only"
+                content.append(.init(string: "• \(file.name) — \(file.mimeType ?? "unknown type") — \(availability)\n", attributes: [.font: NSFont.systemFont(ofSize: 9), .foregroundColor: primaryInk]))
             }
         }
-        content.append(.init(string: "\nMessage ID: \(message.id)\nThread ID: \(message.threadID)\n", attributes: [.font: NSFont.monospacedSystemFont(ofSize: 8, weight: .regular), .foregroundColor: NSColor.secondaryLabelColor]))
+        content.append(.init(string: "\nMessage ID: \(message.id)\nThread ID: \(message.threadID)\n", attributes: [.font: NSFont.monospacedSystemFont(ofSize: 8, weight: .regular), .foregroundColor: secondaryInk]))
         return content
     }
 }

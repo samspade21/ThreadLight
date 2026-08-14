@@ -4,6 +4,38 @@ import Testing
 
 @Suite(.serialized)
 struct SlackClientTests {
+    @Test func oauthTokensRequireExactlyThreadLightReadScopes() {
+        #expect(OAuthTokenSet(accessToken: "token", scope: SlackOAuth.requestedUserScopes).hasExactThreadLightUserScopes)
+        #expect(!OAuthTokenSet(accessToken: "token", scope: "admin.legal_holds:read,users:read").hasExactThreadLightUserScopes)
+        #expect(!OAuthTokenSet(accessToken: "token", scope: SlackOAuth.requestedUserScopes + ",chat:write").hasExactThreadLightUserScopes)
+    }
+
+    @Test func oauthSessionPersistsAcrossVaultInstancesAndLogoutRemovesIt() async throws {
+        let service = "dev.threadlight.tests.oauth-persistence.\(UUID())"
+        let firstVault = SlackTokenVault(keychain: KeychainStore(service: service))
+        let secondVault = SlackTokenVault(keychain: KeychainStore(service: service))
+        let tokens = OAuthTokenSet(
+            accessToken: "xoxp-persisted",
+            refreshToken: "refresh-persisted",
+            expiresAt: Date().addingTimeInterval(3_600),
+            enterpriseID: "E1",
+            authorizedUserID: "U1",
+            scope: SlackOAuth.requestedUserScopes
+        )
+
+        do {
+            try await firstVault.save(tokens, organizationID: "current")
+            let restored = try #require(try await secondVault.load(organizationID: "current"))
+            #expect(restored.accessToken == tokens.accessToken)
+            #expect(restored.refreshToken == tokens.refreshToken)
+            try await secondVault.remove(organizationID: "current")
+            #expect(try await firstVault.load(organizationID: "current") == nil)
+        } catch {
+            try? await firstVault.remove(organizationID: "current")
+            throw error
+        }
+    }
+
     @Test func oauthExchangeUsesPKCEWithoutClientSecretAndParsesRotatingTokens() async throws {
         let session = MockURLProtocol.session { request in
             #expect(request.url?.path == "/api/oauth.v2.access")
@@ -12,14 +44,14 @@ struct SlackClientTests {
             #expect(!body.contains("client_secret"))
             return Self.response(
                 for: request,
-                json: #"{"ok":true,"access_token":"xoxp-test","refresh_token":"refresh-test","expires_in":3600,"authed_user":{"id":"U1","scope":"admin.legal_holds:read"},"enterprise":{"id":"E1"}}"#
+                json: #"{"ok":true,"access_token":"xoxp-test","refresh_token":"refresh-test","expires_in":3600,"authed_user":{"id":"U1","scope":"admin.legal_holds:read,users:read,users:read.email,reactions:read,emoji:read"},"enterprise":{"id":"E1"}}"#
             )
         }
         let tokens = try await SlackOAuthClient(session: session).exchange(code: "code", verifier: "verifier", clientID: "client")
         #expect(tokens.enterpriseID == "E1")
         #expect(tokens.refreshToken == "refresh-test")
-        #expect(tokens.scope == "admin.legal_holds:read")
-        #expect(tokens.hasExactLegalHoldsReadScope)
+        #expect(tokens.scope == SlackOAuth.requestedUserScopes)
+        #expect(tokens.hasExactThreadLightUserScopes)
     }
 
     @Test func tokenWithUnexpectedScopeIsRejectedBeforeLegalHoldRequest() async {
@@ -28,7 +60,7 @@ struct SlackClientTests {
             return Self.response(for: request, json: #"{"ok":true,"policies":[]}"#)
         }
         let client = RefreshingLegalHoldClient(
-            tokens: .init(accessToken: "token", enterpriseID: "E1", scope: "admin.legal_holds:read,chat:write"),
+            tokens: .init(accessToken: "token", enterpriseID: "E1", scope: SlackOAuth.requestedUserScopes + ",chat:write"),
             clientID: "client",
             apiSession: session
         )
@@ -72,6 +104,55 @@ struct SlackClientTests {
         } catch {
             Issue.record("Unexpected error: \(error)")
         }
+    }
+
+    @Test func userProfileUsesLiveSlackAvatarAndEmail() async throws {
+        let session = MockURLProtocol.session { request in
+            #expect(request.url?.path == "/api/users.info")
+            let body = String(data: try Self.bodyData(for: request), encoding: .utf8) ?? ""
+            #expect(body.contains("user=U1"))
+            return Self.response(
+                for: request,
+                json: #"{"ok":true,"user":{"id":"U1","name":"alex","profile":{"display_name":"Alex Rivera","real_name":"Alexandra Rivera","email":"alex@example.com","image_72":"https://avatars.slack-edge.com/live.png"}}}"#
+            )
+        }
+        let profile = try await SlackLegalHoldClient(accessToken: "token", session: session).userProfile(userID: "U1")
+        #expect(profile.displayName == "Alex Rivera")
+        #expect(profile.email == "alex@example.com")
+        #expect(profile.avatarURL == URL(string: "https://avatars.slack-edge.com/live.png"))
+    }
+
+    @Test func reactionsUsesConversationAndTimestampAndReturnsInlineData() async throws {
+        let session = MockURLProtocol.session { request in
+            #expect(request.url?.path == "/api/reactions.get")
+            let body = String(data: try Self.bodyData(for: request), encoding: .utf8) ?? ""
+            #expect(body.contains("channel=C1"))
+            #expect(body.contains("timestamp=1785542400.000100"))
+            #expect(body.contains("full=true"))
+            return Self.response(
+                for: request,
+                json: #"{"ok":true,"type":"message","message":{"reactions":[{"name":"eyes","count":2,"users":["U1","U2"]}]},"channel":"C1"}"#
+            )
+        }
+        let reactions = try await SlackLegalHoldClient(accessToken: "token", session: session).reactions(
+            conversationID: "C1",
+            timestamp: "1785542400.000100"
+        )
+        #expect(reactions == [.init(name: "eyes", count: 2, userIDs: ["U1", "U2"])])
+    }
+
+    @Test func emojiListResolvesCustomEmojiAliases() async throws {
+        let session = MockURLProtocol.session { request in
+            #expect(request.url?.path == "/api/emoji.list")
+            return Self.response(
+                for: request,
+                json: #"{"ok":true,"emoji":{"thank-you":"https://emoji.slack-edge.com/T1/thank-you/id.png","thanks":"alias:thank-you","unsafe":"https://example.com/no.png"}}"#
+            )
+        }
+        let urls = try await SlackLegalHoldClient(accessToken: "token", session: session).emojiURLs()
+        #expect(urls["thank-you"] == URL(string: "https://emoji.slack-edge.com/T1/thank-you/id.png"))
+        #expect(urls["thanks"] == urls["thank-you"])
+        #expect(urls["unsafe"] == nil)
     }
 
     @Test func repeatedPaginationCursorFailsClosed() async {
@@ -148,13 +229,16 @@ struct SlackClientTests {
                 #expect(body.contains("refresh_token=refresh-old"))
                 return Self.response(
                     for: request,
-                    json: #"{"ok":true,"access_token":"xoxp-new","refresh_token":"refresh-new","expires_in":3600,"authed_user":{"id":"U1","scope":"admin.legal_holds:read"},"enterprise":{"id":"E1"}}"#
+                    json: #"{"ok":true,"access_token":"xoxp-new","refresh_token":"refresh-new","expires_in":3600,"authed_user":{"id":"U1","scope":"admin.legal_holds:read,users:read,users:read.email,reactions:read,emoji:read"},"enterprise":{"id":"E1"}}"#
                 )
             }
             #expect(request.value(forHTTPHeaderField: "Authorization") == "Bearer xoxp-new")
             return Self.response(for: request, json: #"{"ok":true,"policies":[],"response_metadata":{"next_cursor":""}}"#)
         }
-        let vault = SlackTokenVault(keychain: KeychainStore(service: "dev.threadlight.tests.\(UUID())"))
+        let vault = SlackTokenVault(keychain: KeychainStore(
+            service: "dev.threadlight.tests.\(UUID())",
+            useVolatileOAuthStorage: true
+        ))
         let client = RefreshingLegalHoldClient(
             tokens: .init(
                 accessToken: "xoxp-old",
@@ -162,7 +246,7 @@ struct SlackClientTests {
                 expiresAt: Date().addingTimeInterval(-60),
                 enterpriseID: "E1",
                 authorizedUserID: "U1",
-                scope: "admin.legal_holds:read"
+                scope: SlackOAuth.requestedUserScopes
             ),
             clientID: "client",
             tokenVault: vault,

@@ -19,3 +19,5 @@ DerivedData/
 *.zip
 __pycache__/
 *.pyc
+*.har
+tmp/

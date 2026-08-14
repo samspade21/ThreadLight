@@ -304,12 +304,12 @@ public struct SlackExportImporter: Sendable {
         }
     }
 
-    private func parseUsers(archive: Archive, entries: [Entry]) throws -> [String: String] {
+    private func parseUsers(archive: Archive, entries: [Entry]) throws -> [String: SlackUserDescriptor] {
         let userEntries = entries.filter {
             let name = ($0.path as NSString).lastPathComponent.lowercased()
             return name == "users.json" || name == "org_users.json"
         }.sorted { $0.path < $1.path }
-        var result: [String: String] = [:]
+        var result: [String: SlackUserDescriptor] = [:]
         for entry in userEntries {
             let data = try read(entry: entry, from: archive)
             let rows = try decodeRows(data, path: entry.path)
@@ -317,16 +317,17 @@ public struct SlackExportImporter: Sendable {
                 guard let id = row["id"] as? String, !id.isEmpty else { continue }
                 let profile = row["profile"] as? [String: Any]
                 let name = (profile?["real_name"] as? String) ?? (profile?["display_name"] as? String) ?? (row["name"] as? String) ?? id
-                if let existing = result[id], existing != name {
+                let avatarURL = Self.avatarURL(from: profile)
+                if let existing = result[id], existing.name != name {
                     throw ThreadLightError.archive("Slack user metadata contains conflicting records for \(id).")
                 }
-                result[id] = name
+                result[id] = .init(name: name, avatarURL: result[id]?.avatarURL ?? avatarURL)
             }
         }
         return result
     }
 
-    private func parseConversations(archive: Archive, entries: [Entry], users: [String: String]) throws -> [String: ConversationDescriptor] {
+    private func parseConversations(archive: Archive, entries: [Entry], users: [String: SlackUserDescriptor]) throws -> [String: ConversationDescriptor] {
         var result: [String: ConversationDescriptor] = [:]
         let files: [(String, ConversationKind)] = [
             ("channels.json", .publicChannel), ("groups.json", .privateChannel),
@@ -344,7 +345,7 @@ public struct SlackExportImporter: Sendable {
                     guard let id = row["id"] as? String else { continue }
                     var name = (row["name"] as? String) ?? id
                     if kind.isDirect, let members = row["members"] as? [String] {
-                        name = members.compactMap { users[$0] }.joined(separator: ", ")
+                        name = members.compactMap { users[$0]?.name }.joined(separator: ", ")
                         if name.isEmpty { name = id }
                     }
                     let descriptor = ConversationDescriptor(id: id, name: name, kind: kind)
@@ -433,7 +434,7 @@ public struct SlackExportImporter: Sendable {
         _ original: [String: Any],
         organizationID: String,
         conversation: ConversationDescriptor,
-        users: [String: String]
+        users: [String: SlackUserDescriptor]
     ) throws -> EvidenceMessage? {
         let row: [String: Any]
         let deleted: Bool
@@ -447,7 +448,7 @@ public struct SlackExportImporter: Sendable {
         guard let timestamp = (row["ts"] as? String) ?? (original["deleted_ts"] as? String),
               let seconds = validEpochSeconds(timestamp) else { return nil }
         let senderID = (row["user"] as? String) ?? (row["bot_id"] as? String) ?? "unknown"
-        let senderName = users[senderID] ?? (row["username"] as? String) ?? senderID
+        let senderName = users[senderID]?.name ?? (row["username"] as? String) ?? senderID
         let files = (row["files"] as? [[String: Any]] ?? []).compactMap { file -> EvidenceFile? in
             guard let id = file["id"] as? String else { return nil }
             let name = (file["name"] as? String) ?? (file["title"] as? String) ?? id
@@ -482,6 +483,7 @@ public struct SlackExportImporter: Sendable {
             threadID: threadID,
             senderID: senderID,
             senderName: senderName,
+            senderAvatarURL: users[senderID]?.avatarURL,
             text: (row["text"] as? String) ?? "",
             postedAt: Date(timeIntervalSince1970: seconds),
             editedAt: edited.flatMap(validEpochSeconds).map(Date.init(timeIntervalSince1970:)),
@@ -500,6 +502,26 @@ public struct SlackExportImporter: Sendable {
               seconds <= 253_402_300_799 else { return nil }
         return seconds
     }
+
+    private static func avatarURL(from profile: [String: Any]?) -> URL? {
+        for key in ["image_72", "image_192", "image_512", "image_48", "image_original"] {
+            guard let value = profile?[key] as? String,
+                  let url = URL(string: value),
+                  Self.isSlackAvatarURL(url) else { continue }
+            return url
+        }
+        return nil
+    }
+
+    private static func isSlackAvatarURL(_ url: URL) -> Bool {
+        guard url.scheme?.lowercased() == "https", let host = url.host?.lowercased() else { return false }
+        return host == "secure.gravatar.com" || host.hasSuffix(".slack-edge.com")
+    }
+}
+
+private struct SlackUserDescriptor {
+    let name: String
+    let avatarURL: URL?
 }
 
 private struct ConversationDescriptor {

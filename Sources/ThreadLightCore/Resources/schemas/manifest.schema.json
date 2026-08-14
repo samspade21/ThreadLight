@@ -56,8 +56,15 @@
         "coverageStart": { "type": "string", "format": "date-time" },
         "coverageEnd": { "type": "string", "format": "date-time" },
         "operatorBinding": { "type": "string", "minLength": 1 },
-        "isPerCustodian": { "const": true }
+        "isPerCustodian": { "type": "boolean" }
       },
+      "allOf": [
+        {
+          "if": { "properties": { "isPerCustodian": { "const": false } } },
+          "then": { "properties": { "custodianID": { "const": "threadlight:hold-wide" } } },
+          "else": { "properties": { "custodianID": { "not": { "const": "threadlight:hold-wide" } } } }
+        }
+      ],
       "additionalProperties": false
     },
     "file": {

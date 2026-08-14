@@ -259,6 +259,62 @@ public actor EvidenceStore {
         return (files.count, files.filter(\.hasOriginalBytes).count)
     }
 
+    public func conversations(holdID: String) throws -> [EvidenceConversation] {
+        guard let hold = try storedHold(id: holdID), hold.status == .active else { return [] }
+        var conditions = ["hm.hold_id = ?"]
+        var values: [SQLiteValue] = [.text(holdID)]
+        Self.appendHoldScope(hold, conditions: &conditions, values: &values)
+        return try rows(
+            """
+            SELECT m.conversation_id, m.conversation_name, m.conversation_kind,
+                   count(DISTINCT m.id), max(m.posted_at)
+            FROM messages m
+            JOIN memberships hm ON hm.message_id = m.id
+            JOIN source_archives a ON a.id = hm.source_archive_id AND a.complete = 1
+            WHERE \(conditions.joined(separator: " AND "))
+            GROUP BY m.conversation_id, m.conversation_name, m.conversation_kind
+            ORDER BY m.conversation_name COLLATE NOCASE, m.conversation_id
+            """,
+            values
+        ) { statement in
+            EvidenceConversation(
+                id: columnText(statement, 0),
+                name: columnText(statement, 1),
+                kind: ConversationKind(rawValue: columnText(statement, 2)) ?? .unknown,
+                messageCount: Int(sqlite3_column_int64(statement, 3)),
+                lastPostedAt: Date(timeIntervalSince1970: sqlite3_column_double(statement, 4))
+            )
+        }
+    }
+
+    public func messages(holdID: String, messageIDs: Set<String>) throws -> [EvidenceMessage] {
+        guard !messageIDs.isEmpty,
+              let hold = try storedHold(id: holdID),
+              hold.status == .active else { return [] }
+        let identifiers = messageIDs.sorted()
+        var found: [String: EvidenceMessage] = [:]
+        for offset in stride(from: 0, to: identifiers.count, by: 400) {
+            let batch = Array(identifiers[offset..<min(offset + 400, identifiers.count)])
+            var conditions = ["hm.hold_id = ?", "m.id IN (\(Array(repeating: "?", count: batch.count).joined(separator: ",")))"]
+            var values: [SQLiteValue] = [.text(holdID)] + batch.map(SQLiteValue.text)
+            Self.appendHoldScope(hold, conditions: &conditions, values: &values)
+            let loaded: [EvidenceMessage] = try rows(
+                """
+                SELECT DISTINCT m.json
+                FROM messages m
+                JOIN memberships hm ON hm.message_id = m.id
+                JOIN source_archives a ON a.id = hm.source_archive_id AND a.complete = 1
+                WHERE \(conditions.joined(separator: " AND "))
+                """,
+                values
+            ) { statement in
+                try Self.decoder.decode(EvidenceMessage.self, from: columnData(statement, 0))
+            }
+            for message in loaded { found[message.id] = message }
+        }
+        return found.values.sorted { $0.postedAt < $1.postedAt }
+    }
+
     public func search(holdID: String, query: SearchQuery) throws -> [EvidenceMessage] {
         guard let hold = try storedHold(id: holdID), hold.status == .active else { return [] }
         let parsed = try SearchParser.parse(query)
@@ -296,7 +352,13 @@ public actor EvidenceStore {
         Self.appendHoldScope(hold, conditions: &conditions, values: &values)
         let filters = parsed.filters
         if let sender = filters.sender { conditions.append("m.sender_name LIKE ? ESCAPE '\\'"); values.append(.text("%\(sender.sqlLikeEscaped)%")) }
+        if let personID = filters.personID {
+            conditions.append("(m.sender_id = ? OR m.text LIKE ? ESCAPE '\\')")
+            values.append(.text(personID))
+            values.append(.text("%<@\(personID.sqlLikeEscaped)>%"))
+        }
         if let custodianID = filters.custodianID { conditions.append("hm.custodian_id = ?"); values.append(.text(custodianID)) }
+        if let conversationID = filters.conversationID { conditions.append("m.conversation_id = ?"); values.append(.text(conversationID)) }
         if let conversation = filters.conversation { conditions.append("m.conversation_name LIKE ? ESCAPE '\\'"); values.append(.text("%\(conversation.sqlLikeEscaped)%")) }
         if let after = filters.after { conditions.append("m.posted_at >= ?"); values.append(.double(after.timeIntervalSince1970)) }
         if let before = filters.before { conditions.append("m.posted_at < ?"); values.append(.double(before.timeIntervalSince1970)) }
@@ -306,8 +368,9 @@ public actor EvidenceStore {
         if let value = filters.isThread { conditions.append(value ? "m.thread_id != m.id" : "m.thread_id = m.id") }
         if let value = filters.isEdited { conditions.append(value ? "m.edited_at IS NOT NULL" : "m.edited_at IS NULL") }
         if let value = filters.isDeleted { conditions.append("m.deleted = ?"); values.append(.int(value ? 1 : 0)) }
-        sql += " WHERE " + conditions.joined(separator: " AND ") + " ORDER BY m.posted_at DESC LIMIT ?"
+        sql += " WHERE " + conditions.joined(separator: " AND ") + " ORDER BY m.posted_at DESC, m.id DESC LIMIT ? OFFSET ?"
         values.append(.int(Int64(query.limit)))
+        values.append(.int(Int64(query.offset)))
 #if THREADLIGHT_DEVELOPMENT
         if ProcessInfo.processInfo.environment["THREADLIGHT_SEARCH_QUERY_PLAN"] == "1" {
             let plan: [String] = try rows("EXPLAIN QUERY PLAN \(sql)", values) { columnText($0, 3) }

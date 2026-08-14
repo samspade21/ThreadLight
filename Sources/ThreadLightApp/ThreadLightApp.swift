@@ -1,37 +1,100 @@
 import SwiftUI
 import ThreadLightCore
 
+struct ConversationWindowRequest: Codable, Hashable {
+    let holdID: String
+    let conversationID: String
+}
+
+private struct FocusedAppModelKey: FocusedValueKey {
+    typealias Value = AppModel
+}
+
+private extension FocusedValues {
+    var threadLightModel: AppModel? {
+        get { self[FocusedAppModelKey.self] }
+        set { self[FocusedAppModelKey.self] = newValue }
+    }
+}
+
 @main
 struct ThreadLightApplication: App {
-    @State private var model = AppModel()
-
     var body: some Scene {
         WindowGroup {
-            RootView()
-                .environment(model)
-                .frame(minWidth: 1_200, minHeight: 700)
+            WorkspaceWindow()
         }
         .defaultSize(width: 1_320, height: 820)
+        .windowStyle(.hiddenTitleBar)
         .commands {
-            CommandGroup(after: .newItem) {
-                Button("Import encrypted package…") { model.chooseHoldTransferImport() }
-                    .keyboardShortcut("i", modifiers: [.command, .shift])
-                    .disabled(!model.isConnected || model.selectedHold == nil)
-                Button("Export selected evidence…") { model.presentExportPanel() }
-                    .keyboardShortcut("e", modifiers: [.command, .shift])
-                    .disabled(model.selectedMessageIDs.isEmpty)
-            }
+            ThreadLightCommands()
         }
+
+        WindowGroup("Conversation", for: ConversationWindowRequest.self) { request in
+            WorkspaceWindow(initialConversation: request.wrappedValue)
+        }
+        .defaultSize(width: 1_140, height: 760)
+        .windowStyle(.hiddenTitleBar)
+        .commands {
+            ThreadLightCommands()
+        }
+
         Settings {
-            SettingsView()
-                .environment(model)
-                .frame(width: 760, height: 680)
+            SettingsWorkspace()
+        }
+    }
+}
+
+private struct WorkspaceWindow: View {
+    @State private var model = AppModel()
+    let initialConversation: ConversationWindowRequest?
+
+    init(initialConversation: ConversationWindowRequest? = nil) {
+        self.initialConversation = initialConversation
+    }
+
+    var body: some View {
+        RootView(initialConversation: initialConversation)
+            .environment(model)
+            .focusedSceneValue(\.threadLightModel, model)
+            .frame(minWidth: 1_200, minHeight: 700)
+    }
+}
+
+private struct SettingsWorkspace: View {
+    @State private var model = AppModel()
+
+    var body: some View {
+        SettingsView()
+            .environment(model)
+            .focusedSceneValue(\.threadLightModel, model)
+            .frame(width: 760, height: 680)
+            .task { await model.start() }
+    }
+}
+
+private struct ThreadLightCommands: Commands {
+    @FocusedValue(\.threadLightModel) private var model
+
+    var body: some Commands {
+        CommandGroup(after: .appSettings) {
+            Divider()
+            Button("Log Out of Slack") { Task { await model?.logOut() } }
+                .disabled(model?.isConnected != true)
+        }
+        CommandGroup(after: .newItem) {
+            Button("Refresh Legal Holds") { Task { await model?.refreshLegalHolds() } }
+                .keyboardShortcut("r", modifiers: .command)
+                .disabled(model?.isConnected != true)
+            Button("Export selected evidence…") { model?.presentExportPanel() }
+                .keyboardShortcut("e", modifiers: [.command, .shift])
+                .disabled(model?.selectedMessageIDs.isEmpty != false)
         }
     }
 }
 
 private struct RootView: View {
     @Environment(AppModel.self) private var model
+    let initialConversation: ConversationWindowRequest?
 
     var body: some View {
         @Bindable var model = model
@@ -45,11 +108,17 @@ private struct RootView: View {
             } else if model.holds.isEmpty {
                 NoLegalHoldsView()
             } else {
-                LegalHoldWorkspace()
+                LegalHoldWorkspace(isConversationWindow: initialConversation != nil)
             }
         }
         .task {
             await model.start()
+            if let initialConversation {
+                model.openConversation(
+                    holdID: initialConversation.holdID,
+                    conversationID: initialConversation.conversationID
+                )
+            }
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(900))
                 guard !Task.isCancelled else { return }
@@ -66,18 +135,38 @@ private struct RootView: View {
 
 private struct LegalHoldWorkspace: View {
     @Environment(AppModel.self) private var model
+    @State private var columnVisibility: NavigationSplitViewVisibility = .all
+    let isConversationWindow: Bool
 
     var body: some View {
         @Bindable var model = model
-        NavigationSplitView {
+        NavigationSplitView(columnVisibility: $columnVisibility) {
             VStack(spacing: 0) {
                 BrandSidebarHeader()
                 Divider()
                 List(selection: $model.sidebarSelection) {
-                    Section("Legal holds") {
-                        ForEach(model.holds) { hold in
+                    Section {
+                        if model.visibleHolds.isEmpty {
+                            Text("No \(model.holdListFilter.title.lowercased()) legal holds")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        ForEach(model.visibleHolds) { hold in
                             HoldSidebarRow(hold: hold)
                                 .tag(AppModel.SidebarSelection.hold(hold.id))
+                        }
+                    } header: {
+                        HStack {
+                            Text("Legal holds")
+                            Spacer()
+                            Picker("Legal hold status", selection: $model.holdListFilter) {
+                                ForEach(AppModel.HoldListFilter.allCases) { filter in
+                                    Text(filter.title).tag(filter)
+                                }
+                            }
+                            .labelsHidden()
+                            .pickerStyle(.menu)
+                            .fixedSize()
                         }
                     }
                 }
@@ -90,11 +179,19 @@ private struct LegalHoldWorkspace: View {
         } content: {
             switch model.sidebarSelection {
             case .setup:
-                ContentUnavailableView("Choose a legal hold", systemImage: "lock.doc")
+                ContentUnavailableView(
+                    model.visibleHolds.isEmpty ? "No \(model.holdListFilter.title.lowercased()) legal holds" : "Choose a legal hold",
+                    systemImage: "lock.doc"
+                )
             case let .hold(id):
                 if let hold = model.holds.first(where: { $0.id == id }) {
-                    SearchWorkspaceView(hold: hold)
-                        .navigationSplitViewColumnWidth(min: 520, ideal: 580, max: 680)
+                    SearchWorkspaceView(
+                        hold: hold,
+                        isLegalHoldListHidden: !isConversationWindow && columnVisibility != .all,
+                        showLegalHolds: { columnVisibility = .all },
+                        showsConversationSidebar: !isConversationWindow
+                    )
+                        .navigationSplitViewColumnWidth(min: 570, ideal: 680)
                 } else {
                     ContentUnavailableView("Choose a legal hold", systemImage: "lock.doc")
                 }
@@ -105,10 +202,15 @@ private struct LegalHoldWorkspace: View {
                 ContentUnavailableView("Choose a message", systemImage: "text.bubble")
             case .hold:
                 MessageDetailView(message: model.selectedMessage)
-                    .navigationSplitViewColumnWidth(min: 420, ideal: 495)
+                    .navigationSplitViewColumnWidth(min: 340, ideal: 430)
             }
         }
         .navigationSplitViewStyle(.balanced)
+        .task(id: model.hasImportedPackage) {
+            withAnimation {
+                columnVisibility = model.hasImportedPackage ? .doubleColumn : .all
+            }
+        }
     }
 }
 
@@ -246,18 +348,26 @@ private struct ConnectionFooter: View {
     @Environment(AppModel.self) private var model
 
     var body: some View {
-        HStack {
-            StatusOrb(color: model.isConnected ? ThreadLightTheme.teal : .secondary, size: 8)
-            Text(model.isConnected ? "Signed in to Slack" : "Not signed in")
-                .font(.caption)
-            Spacer()
-            if ThreadLightBuild.isDevelopment {
-                Text("DEV")
-                    .font(.caption2.bold())
-                    .foregroundStyle(ThreadLightTheme.dangerForeground)
-                    .help("Development build: local keys and session-only OAuth avoid Keychain prompts. Do not use for production evidence.")
+        Menu {
+            Button("Log Out of Slack", role: .destructive) {
+                Task { await model.logOut() }
             }
+            .disabled(!model.isConnected)
+        } label: {
+            HStack {
+                StatusOrb(color: model.isConnected ? ThreadLightTheme.teal : .secondary, size: 8)
+                Text(model.isConnected ? "Signed in to Slack" : "Not signed in")
+                    .font(.caption)
+                Spacer()
+                Image(systemName: "chevron.up.chevron.down")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+            .contentShape(Rectangle())
         }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .buttonStyle(.plain)
         .padding(12)
         .background(.ultraThinMaterial)
     }

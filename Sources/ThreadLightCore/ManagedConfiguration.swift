@@ -3,6 +3,7 @@ import Foundation
 
 public struct ManagedConfiguration: Equatable, Sendable {
     public static let applicationBundleID = "dev.threadlight.app"
+    public static let configurationVersion = 3
 
     public enum Key {
         public static let version = "ThreadLightConfigurationVersion"
@@ -11,7 +12,7 @@ public struct ManagedConfiguration: Equatable, Sendable {
         public static let enterpriseDomain = "ThreadLightEnterpriseDomain"
         public static let expectedOrganizationID = "ThreadLightExpectedOrganizationID"
         public static let redirectURI = "ThreadLightOAuthRedirectURI"
-        public static let requiredScope = "ThreadLightRequiredScope"
+        public static let requiredUserScopes = "ThreadLightRequiredUserScopes"
         public static let retentionDays = "ThreadLightRetentionDays"
     }
 
@@ -51,8 +52,8 @@ public struct ManagedConfiguration: Equatable, Sendable {
               defaults.objectIsForced(forKey: Key.enterpriseDomain),
               defaults.objectIsForced(forKey: Key.expectedOrganizationID),
               defaults.string(forKey: Key.redirectURI) == SlackOAuth.redirectURI,
-              defaults.string(forKey: Key.requiredScope) == "admin.legal_holds:read",
-              defaults.integer(forKey: Key.version) == 1 else { return nil }
+              Set(defaults.stringArray(forKey: Key.requiredUserScopes) ?? []) == SlackOAuth.requiredUserScopes,
+              defaults.integer(forKey: Key.version) == configurationVersion else { return nil }
         return try? .init(
             slackClientID: defaults.string(forKey: Key.slackClientID) ?? "",
             organizationName: defaults.string(forKey: Key.organizationName) ?? "",
@@ -64,13 +65,13 @@ public struct ManagedConfiguration: Equatable, Sendable {
 
     public func profileData() throws -> Data {
         var settings: [String: Any] = [
-            Key.version: 1,
+            Key.version: Self.configurationVersion,
             Key.slackClientID: slackClientID,
             Key.organizationName: organizationName,
             Key.enterpriseDomain: enterpriseDomain,
             Key.expectedOrganizationID: expectedOrganizationID,
             Key.redirectURI: SlackOAuth.redirectURI,
-            Key.requiredScope: "admin.legal_holds:read",
+            Key.requiredUserScopes: SlackOAuth.requiredUserScopes.sorted(),
             Key.retentionDays: retentionDays,
         ]
         // Keep profile generation closed to accidental secret-bearing additions.
@@ -98,6 +99,7 @@ public struct ManagedConfiguration: Equatable, Sendable {
             "PayloadDescription": "Managed public settings for ThreadLight. Each person signs in to Slack on this Mac.",
             "PayloadOrganization": organizationName,
             "PayloadScope": "System",
+            "PayloadRemovalDisallowed": false,
             "PayloadContent": [preferencePayload],
         ]
         return try PropertyListSerialization.data(fromPropertyList: profile, format: .xml, options: 0)

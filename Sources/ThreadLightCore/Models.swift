@@ -185,13 +185,22 @@ public struct Custodian: Identifiable, Codable, Hashable, Sendable {
     public let holdID: String
     public var displayName: String
     public var email: String?
+    public var avatarURL: URL?
     public var isCurrent: Bool
 
-    public init(id: String, holdID: String, displayName: String, email: String? = nil, isCurrent: Bool = true) {
+    public init(
+        id: String,
+        holdID: String,
+        displayName: String,
+        email: String? = nil,
+        avatarURL: URL? = nil,
+        isCurrent: Bool = true
+    ) {
         self.id = id
         self.holdID = holdID
         self.displayName = displayName
         self.email = email
+        self.avatarURL = avatarURL
         self.isCurrent = isCurrent
     }
 }
@@ -204,6 +213,22 @@ public enum ConversationKind: String, Codable, CaseIterable, Sendable {
     case unknown
 
     public var isDirect: Bool { self == .directMessage || self == .groupDirectMessage }
+}
+
+public struct EvidenceConversation: Identifiable, Codable, Hashable, Sendable {
+    public let id: String
+    public let name: String
+    public let kind: ConversationKind
+    public let messageCount: Int
+    public let lastPostedAt: Date
+
+    public init(id: String, name: String, kind: ConversationKind, messageCount: Int, lastPostedAt: Date) {
+        self.id = id
+        self.name = name
+        self.kind = kind
+        self.messageCount = messageCount
+        self.lastPostedAt = lastPostedAt
+    }
 }
 
 public struct EvidenceFile: Identifiable, Codable, Hashable, Sendable {
@@ -259,6 +284,7 @@ public struct EvidenceMessage: Identifiable, Codable, Hashable, Sendable {
     public var threadID: String
     public var senderID: String
     public var senderName: String
+    public var senderAvatarURL: URL?
     public var text: String
     public var postedAt: Date
     public var editedAt: Date?
@@ -275,6 +301,7 @@ public struct EvidenceMessage: Identifiable, Codable, Hashable, Sendable {
         threadID: String,
         senderID: String,
         senderName: String,
+        senderAvatarURL: URL? = nil,
         text: String,
         postedAt: Date,
         editedAt: Date? = nil,
@@ -290,6 +317,7 @@ public struct EvidenceMessage: Identifiable, Codable, Hashable, Sendable {
         self.threadID = threadID
         self.senderID = senderID
         self.senderName = senderName
+        self.senderAvatarURL = senderAvatarURL
         self.text = text
         self.postedAt = postedAt
         self.editedAt = editedAt
@@ -388,7 +416,9 @@ public enum SearchMode: String, Codable, CaseIterable, Identifiable, Sendable {
 
 public struct SearchFilters: Codable, Equatable, Sendable {
     public var sender: String?
+    public var personID: String?
     public var custodianID: String?
+    public var conversationID: String?
     public var conversation: String?
     public var after: Date?
     public var before: Date?
@@ -407,12 +437,14 @@ public struct SearchQuery: Codable, Equatable, Sendable {
     public var mode: SearchMode
     public var filters: SearchFilters
     public var limit: Int
+    public var offset: Int
 
-    public init(text: String = "", mode: SearchMode = .basic, filters: SearchFilters = .init(), limit: Int = 500) {
+    public init(text: String = "", mode: SearchMode = .basic, filters: SearchFilters = .init(), limit: Int = 500, offset: Int = 0) {
         self.text = text
         self.mode = mode
         self.filters = filters
         self.limit = min(max(limit, 1), 2_000)
+        self.offset = max(offset, 0)
     }
 }
 

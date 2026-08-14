@@ -5,25 +5,32 @@ import Security
 public actor KeychainStore {
     public static let shared = KeychainStore()
     private let service: String
+    private let useVolatileOAuthStorage: Bool
     #if THREADLIGHT_DEVELOPMENT
     private var volatileValues: [String: Data] = [:]
     #endif
 
-    public init(service: String = "dev.threadlight.credentials") {
+    public init(
+        service: String = "dev.threadlight.credentials",
+        useVolatileOAuthStorage: Bool = false
+    ) {
         self.service = service
+        self.useVolatileOAuthStorage = useVolatileOAuthStorage
     }
 
     public func save(_ data: Data, account: String, accessControl: CFString = kSecAttrAccessibleWhenUnlockedThisDeviceOnly) throws {
         #if THREADLIGHT_DEVELOPMENT
-        if account.hasPrefix("slack.oauth.") {
+        if account.hasPrefix("slack.oauth."), useVolatileOAuthStorage {
             volatileValues[account] = data
-        } else {
+            return
+        }
+        if !account.hasPrefix("slack.oauth.") {
             let url = try developmentURL(account: account)
             try data.write(to: url, options: [.atomic, .completeFileProtection])
             try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+            return
         }
-        return
-        #else
+        #endif
         let query: [CFString: Any] = [
             kSecClass: kSecClassGenericPassword,
             kSecAttrService: service,
@@ -41,16 +48,17 @@ public actor KeychainStore {
         attributes.forEach { item[$0.key] = $0.value }
         let addStatus = SecItemAdd(item as CFDictionary, nil)
         guard addStatus == errSecSuccess else { throw KeychainError(status: addStatus) }
-        #endif
     }
 
     public func load(account: String) throws -> Data? {
         #if THREADLIGHT_DEVELOPMENT
-        if account.hasPrefix("slack.oauth.") { return volatileValues[account] }
-        let url = try developmentURL(account: account)
-        guard FileManager.default.fileExists(atPath: url.path) else { return nil }
-        return try Data(contentsOf: url)
-        #else
+        if account.hasPrefix("slack.oauth."), useVolatileOAuthStorage { return volatileValues[account] }
+        if !account.hasPrefix("slack.oauth.") {
+            let url = try developmentURL(account: account)
+            guard FileManager.default.fileExists(atPath: url.path) else { return nil }
+            return try Data(contentsOf: url)
+        }
+        #endif
         let query: [CFString: Any] = [
             kSecClass: kSecClassGenericPassword,
             kSecAttrService: service,
@@ -63,16 +71,20 @@ public actor KeychainStore {
         if status == errSecItemNotFound { return nil }
         guard status == errSecSuccess, let data = result as? Data else { throw KeychainError(status: status) }
         return data
-        #endif
     }
 
     public func delete(account: String) throws {
         #if THREADLIGHT_DEVELOPMENT
-        volatileValues.removeValue(forKey: account)
-        let url = try developmentURL(account: account)
-        if FileManager.default.fileExists(atPath: url.path) { try FileManager.default.removeItem(at: url) }
-        return
-        #else
+        if account.hasPrefix("slack.oauth."), useVolatileOAuthStorage {
+            volatileValues.removeValue(forKey: account)
+            return
+        }
+        if !account.hasPrefix("slack.oauth.") {
+            let url = try developmentURL(account: account)
+            if FileManager.default.fileExists(atPath: url.path) { try FileManager.default.removeItem(at: url) }
+            return
+        }
+        #endif
         let query: [CFString: Any] = [
             kSecClass: kSecClassGenericPassword,
             kSecAttrService: service,
@@ -80,7 +92,6 @@ public actor KeychainStore {
         ]
         let status = SecItemDelete(query as CFDictionary)
         guard status == errSecSuccess || status == errSecItemNotFound else { throw KeychainError(status: status) }
-        #endif
     }
 
     public func loadOrCreateRandomKey(account: String, count: Int = 32) throws -> Data {

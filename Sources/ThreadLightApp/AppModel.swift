@@ -7,9 +7,23 @@ import UniformTypeIdentifiers
 @MainActor
 @Observable
 final class AppModel {
+    struct MessageThreadGroup: Identifiable {
+        let id: String
+        let messages: [EvidenceMessage]
+    }
+
     enum SidebarSelection: Hashable {
         case setup
         case hold(String)
+    }
+
+    enum HoldListFilter: String, CaseIterable, Identifiable {
+        case active
+        case inactive
+        case all
+
+        var id: String { rawValue }
+        var title: String { rawValue.capitalized }
     }
 
     enum ExportSelectionScope: String, CaseIterable, Identifiable {
@@ -20,11 +34,33 @@ final class AppModel {
         var title: String { self == .selectedMessages ? "Selected messages" : "Complete selected threads" }
     }
 
+    enum MessageSort: String, CaseIterable, Identifiable {
+        case newest
+        case oldest
+        case sender
+        case conversation
+
+        var id: String { rawValue }
+        var title: String {
+            switch self {
+            case .newest: "Newest first"
+            case .oldest: "Oldest first"
+            case .sender: "Sender A–Z"
+            case .conversation: "Conversation A–Z"
+            }
+        }
+    }
+
     let setup: SetupCoordinator
     var sidebarSelection: SidebarSelection = .setup {
         didSet {
             switch sidebarSelection {
             case .setup:
+                selectedHold = nil
+                custodians = []
+                slackUserProfiles = [:]
+                conversations = []
+                hasImportedPackage = false
                 selectedMessage = nil
                 threadMessages = []
                 selectedMessageIDs.removeAll()
@@ -34,17 +70,33 @@ final class AppModel {
         }
     }
     var holds: [LegalHold] = []
+    var holdListFilter: HoldListFilter = .active {
+        didSet { selectDefaultHold() }
+    }
     var custodians: [Custodian] = []
+    var slackUserProfiles: [String: SlackUserProfile] = [:]
+    var liveReactions: [String: [EvidenceReaction]] = [:]
+    var slackEmojiURLs: [String: URL] = [:]
+    var conversations: [EvidenceConversation] = []
     var importedCustodianIDs: Set<String> = []
-    var messages: [EvidenceMessage] = []
+    var hasImportedPackage = false
+    var messages: [EvidenceMessage] = [] {
+        didSet { rebuildMessageIndex() }
+    }
+    private(set) var messageThreadGroups: [MessageThreadGroup] = []
+    private var messageByID: [String: EvidenceMessage] = [:]
     var threadMessages: [EvidenceMessage] = []
     var selectedHold: LegalHold?
     var selectedMessage: EvidenceMessage?
     var selectedMessageIDs: Set<String> = []
     var queryText = ""
     var searchMode: SearchMode = .basic
+    var messageSort: MessageSort = .newest {
+        didSet { rebuildMessageIndex() }
+    }
     var searchFilters = SearchFilters()
     var isSearching = false
+    private(set) var canLoadMoreMessages = false
     var isStarting = true
     var isDemoSession = false
     var isConnected = false
@@ -54,7 +106,6 @@ final class AppModel {
     var retentionDays: Int {
         didSet { UserDefaults.standard.set(retentionDays, forKey: Self.retentionDaysKey) }
     }
-    var isShowingImport = false
     var isShowingImportReport = false
     var isShowingExportOptions = false
     var lastImportReport: ImportReport?
@@ -71,6 +122,21 @@ final class AppModel {
     private var threadLoadTask: Task<Void, Never>?
     private var searchGeneration = 0
     private var activeStorageNamespace: String?
+    private var requestedConversation: (holdID: String, conversationID: String)?
+    private var requestedSlackUserIDs: Set<String> = []
+    private var requestedReactionMessageIDs: Set<String> = []
+
+    var visibleHolds: [LegalHold] {
+        let filtered = switch holdListFilter {
+        case .active: holds.filter { $0.status == .active }
+        case .inactive: holds.filter { $0.status != .active }
+        case .all: holds
+        }
+        return filtered.sorted {
+            if $0.createdAt == $1.createdAt { return $0.id < $1.id }
+            return $0.createdAt > $1.createdAt
+        }
+    }
 
     init() {
         #if THREADLIGHT_DEVELOPMENT
@@ -115,7 +181,7 @@ final class AppModel {
         guard !setup.slackClientID.isEmpty else { return }
         do {
             guard let tokens = try await tokenVault.load(organizationID: "current") else { return }
-            guard tokens.hasExactLegalHoldsReadScope else {
+            guard tokens.hasExactThreadLightUserScopes else {
                 throw ThreadLightError.authentication("Your saved Slack sign-in no longer has the access ThreadLight needs. Sign in again.")
             }
             let client = RefreshingLegalHoldClient(
@@ -129,6 +195,7 @@ final class AppModel {
             try await openStorage(organizationID: organizationID)
             legalHoldClient = client
             isConnected = true
+            Task { await refreshSlackEmojiCatalog() }
             let currentHoldIDs = Set(loadedHolds.map(\.id))
             for oldHold in try await store?.holds() ?? [] where !currentHoldIDs.contains(oldHold.id) {
                 _ = try await store?.purgeEvidence(holdID: oldHold.id)
@@ -142,7 +209,7 @@ final class AppModel {
                 }
             }
             statusMessage = "Slack connection restored."
-            if let first = loadedHolds.first { sidebarSelection = .hold(first.id) }
+            selectDefaultHold()
         } catch {
             isConnected = false
             statusMessage = "Slack must be reconnected. Local evidence remains available."
@@ -166,6 +233,35 @@ final class AppModel {
         statusMessage = "Slack sign-in canceled."
     }
 
+    func logOut() async {
+        do {
+            try await tokenVault.remove(organizationID: "current")
+            holdLoadTask?.cancel()
+            threadLoadTask?.cancel()
+            legalHoldClient = nil
+            pendingSignIn = nil
+            isShowingImportReport = false
+            isShowingExportOptions = false
+            queryText = ""
+            searchFilters = .init()
+            messages = []
+            canLoadMoreMessages = false
+            conversations = []
+            threadMessages = []
+            slackUserProfiles = [:]
+            liveReactions = [:]
+            slackEmojiURLs = [:]
+            requestedSlackUserIDs = []
+            requestedReactionMessageIDs = []
+            selectedMessageIDs.removeAll()
+            sidebarSelection = .setup
+            statusMessage = "Logged out. Local evidence remains encrypted on this Mac."
+            isConnected = false
+        } catch {
+            show(error)
+        }
+    }
+
     func completeSlackSignIn(pastedCallback: String) async {
         guard let attempt = pendingSignIn else { return }
         do {
@@ -186,8 +282,8 @@ final class AppModel {
     }
 
     private func finishSlackConnection(tokens: OAuthTokenSet) async throws {
-        guard tokens.hasExactLegalHoldsReadScope else {
-            throw ThreadLightError.authentication("Slack did not grant exactly admin.legal_holds:read. Remove every other user scope and reconnect from ThreadLight. Keep the installation bot scope team:read.")
+        guard tokens.hasExactThreadLightUserScopes else {
+            throw ThreadLightError.authentication("Slack did not grant ThreadLight's five read-only user scopes. Update the Slack app manifest, then reconnect.")
         }
         let validationClient = SlackLegalHoldClient(accessToken: tokens.accessToken)
         let loadedHolds = try await validationClient.listPolicies(status: nil)
@@ -202,6 +298,7 @@ final class AppModel {
         )
         legalHoldClient = client
         isConnected = true
+        Task { await refreshSlackEmojiCatalog() }
         let currentHoldIDs = Set(loadedHolds.map(\.id))
         for oldHold in try await store?.holds() ?? [] where !currentHoldIDs.contains(oldHold.id) {
             _ = try await store?.purgeEvidence(holdID: oldHold.id)
@@ -220,7 +317,7 @@ final class AppModel {
         setup.update(.enterpriseInstall, state: .ready, message: "Slack returned \(loadedHolds.count) legal hold policies.")
         statusMessage = "Signed in to Slack. Choose a legal hold or import its encrypted package."
         touchActivity()
-        if let first = loadedHolds.first { sidebarSelection = .hold(first.id) }
+        selectDefaultHold()
     }
 
     func selectHold(id: String) {
@@ -230,54 +327,112 @@ final class AppModel {
         threadMessages = []
         selectedMessageIDs.removeAll()
         importedCustodianIDs.removeAll()
+        conversations = []
+        searchFilters.conversationID = nil
+        canLoadMoreMessages = false
+        hasImportedPackage = false
         holdLoadTask?.cancel()
         holdLoadTask = Task {
             await loadCustodians(for: hold)
             guard !Task.isCancelled, selectedHold?.id == hold.id else { return }
-            await search()
+            if hasImportedPackage {
+                await loadConversations(for: hold)
+                if requestedConversation?.holdID == hold.id {
+                    searchFilters.conversationID = requestedConversation?.conversationID
+                    requestedConversation = nil
+                }
+                await search()
+            } else {
+                messages = []
+                isSearching = false
+                statusMessage = "Waiting for the encrypted package for \(hold.name)."
+            }
         }
     }
 
     func loadCustodians(for hold: LegalHold) async {
         do {
-            let loaded: [Custodian]
+            var loaded: [Custodian]
             if hold.status != .active {
                 loaded = try await store?.custodians(holdID: hold.id) ?? []
             } else if let legalHoldClient {
                 loaded = try await legalHoldClient.listCustodians(policyID: hold.id)
                 _ = try await reconcileCustodians(loaded, for: hold)
+                loaded = try await store?.custodians(holdID: hold.id) ?? loaded
             } else {
                 loaded = try await store?.custodians(holdID: hold.id) ?? []
             }
             guard !Task.isCancelled, selectedHold?.id == hold.id else { return }
             custodians = loaded
+            await refreshSlackUserProfiles(for: Set(loaded.map(\.id)))
             try await refreshEvidenceReadiness(for: hold)
         } catch is CancellationError {
             return
         } catch { show(error) }
     }
 
-    func search() async {
+    func search(loadMore: Bool = false) async {
         searchGeneration += 1
         let generation = searchGeneration
         guard let hold = selectedHold, hold.status == .active, let store else {
             messages = []
+            canLoadMoreMessages = false
             isSearching = false
             return
         }
         isSearching = true
         do {
-            let query = SearchQuery(text: queryText, mode: searchMode, filters: searchFilters)
+            let pageSize = 500
+            let offset = loadMore ? messages.count : 0
+            let query = SearchQuery(
+                text: queryText,
+                mode: searchMode,
+                filters: searchFilters,
+                limit: pageSize + 1,
+                offset: offset
+            )
             let results = try await store.search(holdID: hold.id, query: query)
             guard generation == searchGeneration, selectedHold?.id == hold.id else { return }
-            messages = results
-            selectedMessageIDs.formIntersection(Set(results.map(\.id)))
-            statusMessage = "\(messages.count) matching messages"
+            let page = Array(results.prefix(pageSize))
+            if loadMore {
+                let existingIDs = Set(messages.map(\.id))
+                messages.append(contentsOf: page.filter { !existingIDs.contains($0.id) })
+            } else {
+                messages = page
+            }
+            canLoadMoreMessages = results.count > pageSize
+            statusMessage = canLoadMoreMessages
+                ? "\(messages.count) results loaded • More available"
+                : "\(messages.count) matching message\(messages.count == 1 ? "" : "s")"
             touchActivity()
+            Task { await refreshSlackUserProfiles(for: Set(page.map(\.senderID))) }
         } catch {
             if generation == searchGeneration { show(error) }
         }
         if generation == searchGeneration { isSearching = false }
+    }
+
+    func loadMoreMessages() async {
+        guard canLoadMoreMessages, !isSearching else { return }
+        await search(loadMore: true)
+    }
+
+    func selectConversation(id: String?) {
+        searchFilters.conversationID = id
+        selectedMessage = nil
+        threadMessages = []
+        selectedMessageIDs.removeAll()
+        Task { await search() }
+    }
+
+    func openConversation(holdID: String, conversationID: String) {
+        requestedConversation = (holdID, conversationID)
+        holdListFilter = .all
+        if sidebarSelection == .hold(holdID) {
+            selectHold(id: holdID)
+        } else {
+            sidebarSelection = .hold(holdID)
+        }
     }
 
     func selectMessage(_ message: EvidenceMessage) {
@@ -289,10 +444,15 @@ final class AppModel {
                 let loaded = try await store.thread(holdID: hold.id, threadID: message.threadID)
                 guard !Task.isCancelled, selectedHold?.id == hold.id, selectedMessage?.id == message.id else { return }
                 threadMessages = loaded
+                Task { await refreshSlackUserProfiles(for: Set(loaded.map(\.senderID))) }
             }
             catch is CancellationError { return }
             catch { show(error) }
         }
+    }
+
+    func message(id: String) -> EvidenceMessage? {
+        messageByID[id]
     }
 
     func toggleEvidenceSelection(_ id: String) {
@@ -300,13 +460,52 @@ final class AppModel {
         else { selectedMessageIDs.insert(id) }
     }
 
-    func presentImportPanel() {
-        guard selectedHold?.status == .active else { return }
-        isShowingImport = true
+    func refreshReactions(for message: EvidenceMessage) async {
+        guard isConnected,
+              let legalHoldClient,
+              requestedReactionMessageIDs.insert(message.id).inserted,
+              let timestamp = slackTimestamp(for: message) else { return }
+        guard let reactions = try? await legalHoldClient.reactions(
+            conversationID: message.conversationID,
+            timestamp: timestamp
+        ) else { return }
+        liveReactions[message.id] = reactions
     }
 
-    func importHoldArchives(urls: [URL], operatorBinding: String) async {
-        guard let hold = selectedHold, let store, !urls.isEmpty else { return }
+    private func refreshSlackEmojiCatalog() async {
+        guard isConnected, let legalHoldClient,
+              let urls = try? await legalHoldClient.emojiURLs() else { return }
+        slackEmojiURLs = urls
+    }
+
+    func setEvidenceSelection(for conversation: EvidenceConversation, selected: Bool) async {
+        guard let hold = selectedHold, let store else { return }
+        guard conversation.messageCount <= 50_000 else {
+            show(ThreadLightError.export("This conversation has more than 50,000 messages. Narrow the search before selecting evidence."))
+            return
+        }
+        do {
+            var filters = SearchFilters()
+            filters.conversationID = conversation.id
+            let conversationMessages = try await store.search(
+                holdID: hold.id,
+                query: .init(filters: filters, limit: 50_000)
+            )
+            let ids = Set(conversationMessages.map(\.id))
+            if selected {
+                selectedMessageIDs.formUnion(ids)
+                statusMessage = "Selected \(ids.count) messages from \(conversation.name)."
+            } else {
+                selectedMessageIDs.subtract(ids)
+                statusMessage = "Unselected messages from \(conversation.name)."
+            }
+        } catch {
+            show(error)
+        }
+    }
+
+    func importHoldArchives(urls: [URL], operatorBinding: String, showReport: Bool = true) async -> Bool {
+        guard let hold = selectedHold, let store, !urls.isEmpty else { return false }
         importProgress = nil
         defer { importProgress = nil }
         var imported = 0
@@ -330,19 +529,26 @@ final class AppModel {
                 warningCount += report.warnings.count
                 lastImportReport = report
             }
-            isShowingImportReport = true
+            isShowingImportReport = showReport
+            hasImportedPackage = imported > 0
             setup.update(.exportAccess, state: .ready, message: "Slack export access produced a valid archive.")
             setup.update(.custodianExports, state: .ready, message: "\(imported) hold-wide Slack export ZIP(s) imported.")
             statusMessage = "Imported \(imported) ZIP file(s) and \(messageCount) normalized message(s)\(warningCount == 0 ? "." : " with \(warningCount) warning(s).")"
             touchActivity()
+            await loadConversations(for: hold)
             await search()
+            return true
         } catch is CancellationError {
             statusMessage = "Import stopped. Completed ZIP files remain available; an interrupted ZIP can be resumed."
-        } catch { show(error) }
+            return false
+        } catch {
+            show(error)
+            return false
+        }
     }
 
-    func chooseHoldTransferDestination() {
-        guard selectedHold?.status == .active else { return }
+    func chooseHoldTransferDestination() -> URL? {
+        guard selectedHold?.status == .active else { return nil }
         let panel = NSSavePanel()
         panel.title = "Save the encrypted legal hold package"
         panel.nameFieldStringValue = "ThreadLight-Hold-\(selectedHold?.name.fileSafePrefix ?? "Export").threadlight-hold"
@@ -350,12 +556,12 @@ final class AppModel {
         panel.allowsOtherFileTypes = false
         panel.canCreateDirectories = true
         panel.prompt = "Export"
-        guard panel.runModal() == .OK, let url = panel.url else { return }
-        Task { await exportHoldTransfer(to: url) }
+        guard panel.runModal() == .OK else { return nil }
+        return panel.url
     }
 
-    func exportHoldTransfer(to destination: URL) async {
-        guard let hold = selectedHold, let store, let legalHoldClient else { return }
+    func exportHoldTransfer(to destination: URL) async -> Bool {
+        guard let hold = selectedHold, let store, let legalHoldClient else { return false }
         let access = destination.startAccessingSecurityScopedResource()
         defer { if access { destination.stopAccessingSecurityScopedResource() } }
         do {
@@ -372,19 +578,11 @@ final class AppModel {
             )
             statusMessage = "Created encrypted package \(destination.lastPathComponent). Transfer it through your approved channel."
             touchActivity()
-        } catch { show(error) }
-    }
-
-    func chooseHoldTransferImport() {
-        guard isConnected else { return }
-        let panel = NSOpenPanel()
-        panel.title = "Import an encrypted legal hold package"
-        panel.allowedContentTypes = [UTType(filenameExtension: "threadlight-hold") ?? .data]
-        panel.allowsMultipleSelection = false
-        panel.canChooseDirectories = false
-        panel.prompt = "Import"
-        guard panel.runModal() == .OK, let url = panel.url else { return }
-        Task { await importHoldTransfer(from: url) }
+            return true
+        } catch {
+            show(error)
+            return false
+        }
     }
 
     func importHoldTransfer(from url: URL) async {
@@ -392,9 +590,9 @@ final class AppModel {
         let access = url.startAccessingSecurityScopedResource()
         defer { if access { url.stopAccessingSecurityScopedResource() } }
         do {
-            let currentHolds = try await legalHoldClient.listPolicies(status: .active)
+            let currentHolds = try await legalHoldClient.listPolicies(status: nil)
             var candidates: [HoldTransferCandidate] = []
-            for hold in currentHolds {
+            for hold in currentHolds where hold.status == .active {
                 let currentCustodians = try await legalHoldClient.listCustodians(policyID: hold.id)
                 _ = try await reconcileCustodians(currentCustodians, for: hold)
                 candidates.append(.init(hold: hold, custodians: currentCustodians))
@@ -421,13 +619,20 @@ final class AppModel {
             }
             for hold in refreshed {
                 try await store.save(hold: hold)
-                let currentCustodians = try await legalHoldClient.listCustodians(policyID: hold.id)
-                if try await reconcileCustodians(currentCustodians, for: hold) { invalidated += 1 }
+                if hold.status == .active {
+                    let currentCustodians = try await legalHoldClient.listCustodians(policyID: hold.id)
+                    if try await reconcileCustodians(currentCustodians, for: hold) { invalidated += 1 }
+                }
             }
             holds = refreshed
+            selectDefaultHold()
             if let selectedHold, let current = refreshed.first(where: { $0.id == selectedHold.id }) {
                 self.selectedHold = current
                 await loadCustodians(for: current)
+                if hasImportedPackage {
+                    await loadConversations(for: current)
+                    await search()
+                }
             }
             statusMessage = invalidated == 0
                 ? "Refreshed \(refreshed.count) legal hold(s) from Slack."
@@ -475,29 +680,116 @@ final class AppModel {
         isShowingExportOptions = true
     }
 
-    func chooseExportDestination(selectionScope: ExportSelectionScope, formats: Set<EvidenceExportFormat>) {
+    func chooseExportDestination(
+        selectionScope: ExportSelectionScope,
+        formats: Set<EvidenceExportFormat>,
+        includeEvidenceSigning: Bool
+    ) {
         guard !selectedMessageIDs.isEmpty, !formats.isEmpty else { return }
         isShowingExportOptions = false
+        if !includeEvidenceSigning, formats.count == 1, let format = formats.first {
+            let panel = NSSavePanel()
+            panel.title = "Export Evidence"
+            panel.nameFieldStringValue = "ThreadLight-\(selectedHold?.name.fileSafePrefix ?? "Evidence").\(format.rawValue)"
+            panel.allowedContentTypes = [format == .pdf ? .pdf : .json]
+            panel.allowsOtherFileTypes = false
+            panel.canCreateDirectories = true
+            panel.isExtensionHidden = false
+            panel.prompt = "Export"
+            guard panel.runModal() == .OK, let url = panel.url else { return }
+            Task {
+                await exportEvidence(
+                    to: url,
+                    selectionScope: selectionScope,
+                    formats: formats,
+                    includeEvidenceSigning: false,
+                    exactFileFormat: format
+                )
+            }
+            return
+        }
+
         let panel = NSOpenPanel()
         panel.canChooseDirectories = true
         panel.canChooseFiles = false
         panel.canCreateDirectories = true
-        panel.prompt = "Export here"
-        panel.title = "Choose an evidence export folder"
+        panel.prompt = "Export"
+        panel.title = "Export Evidence"
         if panel.runModal() == .OK, let url = panel.url {
-            Task { await exportEvidence(to: url, selectionScope: selectionScope, formats: formats) }
+            Task {
+                await exportEvidence(
+                    to: url,
+                    selectionScope: selectionScope,
+                    formats: formats,
+                    includeEvidenceSigning: includeEvidenceSigning
+                )
+            }
+        }
+    }
+
+    func chooseConversationPDFDestination(_ conversation: EvidenceConversation) {
+        guard selectedHold?.status == .active else { return }
+        let panel = NSSavePanel()
+        panel.title = "Export this conversation to PDF"
+        panel.nameFieldStringValue = "ThreadLight-\(selectedHold?.name.fileSafePrefix ?? "Hold")-\(conversation.name.fileSafePrefix).pdf"
+        panel.allowedContentTypes = [.pdf]
+        panel.allowsOtherFileTypes = false
+        panel.canCreateDirectories = true
+        panel.prompt = "Export"
+        guard panel.runModal() == .OK, let destination = panel.url else { return }
+        Task { await exportConversationPDF(conversationID: conversation.id, to: destination) }
+    }
+
+    private func exportConversationPDF(conversationID: String, to destination: URL) async {
+        guard let hold = selectedHold, let store else { return }
+        let access = destination.startAccessingSecurityScopedResource()
+        defer { if access { destination.stopAccessingSecurityScopedResource() } }
+        do {
+            guard let legalHoldClient else {
+                throw ThreadLightError.scope("Reconnect Slack before exporting so ThreadLight can confirm the hold is still active.")
+            }
+            let currentHold = try await legalHoldClient.policy(id: hold.id)
+            guard currentHold.status == .active else {
+                throw ThreadLightError.scope("Slack reports that this hold is not active. Export is blocked.")
+            }
+            let currentCustodians = try await legalHoldClient.listCustodians(policyID: currentHold.id)
+            guard !(try await reconcileCustodians(currentCustodians, for: currentHold)) else {
+                throw ThreadLightError.scope("The legal hold changed in Slack. Import a new encrypted package before exporting this conversation.")
+            }
+            if let index = holds.firstIndex(where: { $0.id == currentHold.id }) { holds[index] = currentHold }
+            selectedHold = currentHold
+            custodians = currentCustodians
+
+            var filters = SearchFilters()
+            filters.conversationID = conversationID
+            let conversationMessages = try await store.search(
+                holdID: currentHold.id,
+                query: .init(filters: filters, limit: 50_000)
+            )
+            let url = try await EvidenceExporter(store: store, resourceVault: resourceVault).exportPDF(
+                messages: conversationMessages,
+                hold: currentHold,
+                custodians: currentCustodians,
+                destination: destination
+            )
+            statusMessage = "Created \(url.lastPathComponent)."
+            touchActivity()
+        } catch {
+            show(error)
         }
     }
 
     func exportEvidence(
         to destination: URL,
         selectionScope: ExportSelectionScope = .selectedMessages,
-        formats: Set<EvidenceExportFormat> = [.json, .pdf]
+        formats: Set<EvidenceExportFormat> = [.pdf],
+        includeEvidenceSigning: Bool = false,
+        exactFileFormat: EvidenceExportFormat? = nil
     ) async {
         guard let hold = selectedHold, let store else { return }
         let access = destination.startAccessingSecurityScopedResource()
         defer { if access { destination.stopAccessingSecurityScopedResource() } }
-        var selected = messages.filter { selectedMessageIDs.contains($0.id) }
+        var selected: [EvidenceMessage] = []
         do {
             guard let legalHoldClient else {
                 throw ThreadLightError.scope("Reconnect Slack before exporting so ThreadLight can confirm the hold is still active.")
@@ -515,6 +807,7 @@ final class AppModel {
             try await store.replaceCustodians(currentCustodians, holdID: currentHold.id)
             custodians = currentCustodians
             try await refreshEvidenceReadiness(for: currentHold)
+            selected = try await store.messages(holdID: currentHold.id, messageIDs: selectedMessageIDs)
             if selectionScope == .completeThreads {
                 var complete: [String: EvidenceMessage] = [:]
                 for threadID in Set(selected.map(\.threadID)).sorted() {
@@ -525,14 +818,45 @@ final class AppModel {
                 selected = complete.values.sorted { $0.postedAt < $1.postedAt }
             }
             let exporter = EvidenceExporter(store: store, resourceVault: resourceVault)
-            let result = try await exporter.export(
-                messages: selected,
-                hold: currentHold,
-                custodians: currentCustodians,
-                destination: destination,
-                formats: formats
-            )
-            statusMessage = "Created and verified \(result.packageURL.lastPathComponent). Signer key: \(result.keyID.prefix(12))…"
+            if includeEvidenceSigning {
+                let result = try await exporter.export(
+                    messages: selected,
+                    hold: currentHold,
+                    custodians: currentCustodians,
+                    destination: destination,
+                    formats: formats
+                )
+                statusMessage = "Created and verified \(result.packageURL.lastPathComponent). Signer key: \(result.keyID.prefix(12))…"
+            } else if let exactFileFormat {
+                let url: URL
+                switch exactFileFormat {
+                case .pdf:
+                    url = try await exporter.exportPDF(
+                        messages: selected,
+                        hold: currentHold,
+                        custodians: currentCustodians,
+                        destination: destination
+                    )
+                case .json:
+                    url = try await exporter.exportJSON(
+                        messages: selected,
+                        hold: currentHold,
+                        custodians: currentCustodians,
+                        destination: destination
+                    )
+                }
+                statusMessage = "Created \(url.lastPathComponent)."
+            } else {
+                let result = try await exporter.exportFiles(
+                    messages: selected,
+                    hold: currentHold,
+                    custodians: currentCustodians,
+                    destination: destination,
+                    formats: formats
+                )
+                let names = result.fileURLs.map(\.lastPathComponent).joined(separator: ", ")
+                statusMessage = "Created \(result.fileURLs.count) evidence file\(result.fileURLs.count == 1 ? "" : "s"): \(names)."
+            }
             touchActivity()
         } catch { show(error) }
     }
@@ -610,7 +934,7 @@ final class AppModel {
                 }
                 UserDefaults.standard.removeObject(forKey: Self.lastActivityKeyPrefix + namespace)
             }
-            holds.removeAll(); custodians.removeAll(); importedCustodianIDs.removeAll(); messages.removeAll(); selectedHold = nil
+            holds.removeAll(); custodians.removeAll(); conversations.removeAll(); importedCustodianIDs.removeAll(); hasImportedPackage = false; messages.removeAll(); selectedHold = nil
             selectedMessage = nil; selectedMessageIDs.removeAll(); threadMessages.removeAll()
             sidebarSelection = .setup
             setup.update(.custodianExports, state: .pending)
@@ -644,6 +968,26 @@ final class AppModel {
             defer { if access { destination.stopAccessingSecurityScopedResource() } }
             try Data(contents.utf8).write(to: destination, options: .atomic)
             statusMessage = status
+        } catch {
+            show(error)
+        }
+    }
+
+    func saveSlackExportScript(_ contents: String) {
+        let panel = NSSavePanel()
+        panel.title = "Save the Slack export script"
+        panel.nameFieldStringValue = "ThreadLight-Slack-Export-\(selectedHold?.name.fileSafePrefix ?? "Export").js"
+        panel.allowedContentTypes = [.javaScript]
+        panel.allowsOtherFileTypes = false
+        panel.canCreateDirectories = true
+        panel.prompt = "Save script"
+        guard panel.runModal() == .OK, let destination = panel.url else { return }
+
+        do {
+            let access = destination.startAccessingSecurityScopedResource()
+            defer { if access { destination.stopAccessingSecurityScopedResource() } }
+            try Data(contents.utf8).write(to: destination, options: .atomic)
+            statusMessage = "Saved the Slack export script."
         } catch {
             show(error)
         }
@@ -687,6 +1031,7 @@ final class AppModel {
     private func refreshEvidenceReadiness(for hold: LegalHold) async throws {
         guard let store else { return }
         let archives = try await store.archives(holdID: hold.id)
+        if selectedHold?.id == hold.id { hasImportedPackage = !archives.isEmpty }
         importedCustodianIDs = []
         if archives.isEmpty { setup.update(.custodianExports, state: .pending) }
         else { setup.update(.custodianExports, state: .ready, message: "\(archives.count) hold-wide Slack export ZIP(s) imported.") }
@@ -701,10 +1046,113 @@ final class AppModel {
         }
     }
 
+    private func loadConversations(for hold: LegalHold) async {
+        guard let store else { return }
+        do {
+            let loaded = try await store.conversations(holdID: hold.id)
+            guard !Task.isCancelled, selectedHold?.id == hold.id else { return }
+            conversations = loaded
+            if let selectedID = searchFilters.conversationID,
+               !loaded.contains(where: { $0.id == selectedID }) {
+                searchFilters.conversationID = nil
+            }
+        } catch is CancellationError {
+            return
+        } catch {
+            show(error)
+        }
+    }
+
+    private func refreshSlackUserProfiles(for userIDs: Set<String>, retryFailures: Bool = true) async {
+        guard isConnected, let legalHoldClient else { return }
+        let missing = userIDs.subtracting(requestedSlackUserIDs)
+        requestedSlackUserIDs.formUnion(missing)
+        let identifiers = missing.sorted()
+        var failed: Set<String> = []
+        let batchSize = retryFailures ? 4 : 1
+        for start in stride(from: 0, to: identifiers.count, by: batchSize) {
+            guard !Task.isCancelled else { return }
+            let batch = identifiers[start..<min(start + batchSize, identifiers.count)]
+            let results = await withTaskGroup(of: (String, SlackUserProfile?).self, returning: [(String, SlackUserProfile?)].self) { group in
+                for userID in batch {
+                    group.addTask { (userID, try? await legalHoldClient.userProfile(userID: userID)) }
+                }
+                var loaded: [(String, SlackUserProfile?)] = []
+                for await result in group { loaded.append(result) }
+                return loaded
+            }
+            for (userID, profile) in results {
+                guard let profile else {
+                    requestedSlackUserIDs.remove(userID)
+                    failed.insert(userID)
+                    continue
+                }
+                slackUserProfiles[profile.id] = profile
+                guard let index = custodians.firstIndex(where: { $0.id == profile.id }) else { continue }
+                custodians[index].displayName = profile.displayName
+                custodians[index].email = profile.email
+                custodians[index].avatarURL = profile.avatarURL
+            }
+            if identifiers.count > batchSize {
+                try? await Task.sleep(for: .milliseconds(250))
+            }
+        }
+        if !failed.isEmpty, retryFailures, !Task.isCancelled {
+            try? await Task.sleep(for: .seconds(1))
+            await refreshSlackUserProfiles(for: failed, retryFailures: false)
+        }
+        if let holdID = selectedHold?.id, !custodians.isEmpty {
+            try? await store?.replaceCustodians(custodians, holdID: holdID)
+        }
+    }
+
+    private func slackTimestamp(for message: EvidenceMessage) -> String? {
+        let prefix = "\(message.conversationID):"
+        guard let range = message.id.range(of: prefix, options: .backwards) else { return nil }
+        let timestamp = String(message.id[range.upperBound...])
+        guard timestamp.contains("."), timestamp.allSatisfy({ $0.isNumber || $0 == "." }) else { return nil }
+        return timestamp
+    }
+
+    private func rebuildMessageIndex() {
+        messageByID = Dictionary(uniqueKeysWithValues: messages.map { ($0.id, $0) })
+        let chronological = messages.sorted {
+            if $0.postedAt == $1.postedAt { return $0.id < $1.id }
+            return $0.postedAt < $1.postedAt
+        }
+        let grouped = Dictionary(grouping: chronological, by: \.threadID)
+            .map { MessageThreadGroup(id: $0.key, messages: $0.value) }
+        messageThreadGroups = grouped.sorted { lhs, rhs in
+            switch messageSort {
+            case .newest:
+                return (lhs.messages.last?.postedAt ?? .distantPast) > (rhs.messages.last?.postedAt ?? .distantPast)
+            case .oldest:
+                return (lhs.messages.first?.postedAt ?? .distantFuture) < (rhs.messages.first?.postedAt ?? .distantFuture)
+            case .sender:
+                let comparison = (lhs.messages.first?.senderName ?? "").localizedCaseInsensitiveCompare(rhs.messages.first?.senderName ?? "")
+                return comparison == .orderedSame ? lhs.id < rhs.id : comparison == .orderedAscending
+            case .conversation:
+                let comparison = (lhs.messages.first?.conversationName ?? "").localizedCaseInsensitiveCompare(rhs.messages.first?.conversationName ?? "")
+                return comparison == .orderedSame ? lhs.id < rhs.id : comparison == .orderedAscending
+            }
+        }
+    }
+
     @discardableResult
     private func reconcileCustodians(_ loaded: [Custodian], for hold: LegalHold) async throws -> Bool {
         guard let store else { return false }
         let previous = try await store.custodians(holdID: hold.id)
+        let previousByID = Dictionary(uniqueKeysWithValues: previous.map { ($0.id, $0) })
+        let reconciled = loaded.map { custodian in
+            guard let prior = previousByID[custodian.id] else { return custodian }
+            var result = custodian
+            if result.displayName == result.id, prior.displayName != prior.id {
+                result.displayName = prior.displayName
+            }
+            result.email = result.email ?? prior.email
+            result.avatarURL = result.avatarURL ?? prior.avatarURL
+            return result
+        }
         var invalidated = false
         if !previous.isEmpty,
            HoldAccessKey.fingerprint(hold: hold, custodians: previous)
@@ -714,19 +1162,29 @@ final class AppModel {
             statusMessage = "The legal hold “\(hold.name)” changed in Slack. ThreadLight removed its old local data because that encrypted package is no longer valid. Import a new package."
             if selectedHold?.id == hold.id {
                 messages = []
+                conversations = []
+                searchFilters.conversationID = nil
                 selectedMessage = nil
                 selectedMessageIDs.removeAll()
                 threadMessages = []
             }
         }
         try await store.save(hold: hold)
-        try await store.replaceCustodians(loaded, holdID: hold.id)
+        try await store.replaceCustodians(reconciled, holdID: hold.id)
         return invalidated
     }
 
     private func touchActivity() {
         guard let activeStorageNamespace else { return }
         UserDefaults.standard.set(Date(), forKey: Self.lastActivityKeyPrefix + activeStorageNamespace)
+    }
+
+    private func selectDefaultHold() {
+        if case let .hold(id) = sidebarSelection,
+           visibleHolds.contains(where: { $0.id == id }) {
+            return
+        }
+        sidebarSelection = visibleHolds.first.map { .hold($0.id) } ?? .setup
     }
 
     private func knownStorageNamespaces() -> Set<String> {
@@ -777,13 +1235,15 @@ final class AppModel {
             setup.update(.attachments, state: .pending)
         }
         custodians = []
+        conversations = []
         importedCustodianIDs = []
+        hasImportedPackage = false
         messages = []
         threadMessages = []
         selectedHold = nil
         selectedMessage = nil
         selectedMessageIDs = []
-        sidebarSelection = holds.first.map { .hold($0.id) } ?? .setup
+        selectDefaultHold()
         touchActivity()
     }
 
@@ -1012,6 +1472,21 @@ private actor DemoLegalHoldClient: LegalHoldClient {
 
     func listCustodians(policyID: String) async throws -> [Custodian] {
         custodians.filter { $0.holdID == policyID }
+    }
+
+    func userProfile(userID: String) async throws -> SlackUserProfile {
+        guard let custodian = custodians.first(where: { $0.id == userID }) else {
+            return .init(id: userID, displayName: userID, avatarURL: nil)
+        }
+        return .init(id: userID, displayName: custodian.displayName, email: custodian.email, avatarURL: custodian.avatarURL)
+    }
+
+    func reactions(conversationID: String, timestamp: String) async throws -> [EvidenceReaction] {
+        []
+    }
+
+    func emojiURLs() async throws -> [String: URL] {
+        [:]
     }
 }
 #endif

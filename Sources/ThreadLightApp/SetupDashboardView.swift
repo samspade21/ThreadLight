@@ -185,30 +185,48 @@ struct SlackAppInstallationSettingsView: View {
         if model.pendingSignIn != nil { return "Waiting for sign-in…" }
         return "Sign in and verify"
     }
+}
 
-    private func setupSection<Content: View>(
-        number: Int,
-        title: String,
-        @ViewBuilder content: () -> Content
-    ) -> some View {
-        GroupBox {
-            VStack(alignment: .leading, spacing: 12, content: content)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.top, 4)
-        } label: {
-            Label {
-                Text("\(number). \(title)")
-                    .font(.headline)
-            } icon: {
-                Image(systemName: "\(number).circle.fill")
-                    .foregroundStyle(ThreadLightTheme.accentForeground)
-            }
+/// Numbered, GroupBox-styled step used by the setup and package-preparation pages.
+private func setupSection<Content: View>(
+    number: Int,
+    title: String,
+    @ViewBuilder content: () -> Content
+) -> some View {
+    GroupBox {
+        VStack(alignment: .leading, spacing: 12, content: content)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.top, 4)
+    } label: {
+        Label {
+            Text("\(number). \(title)")
+                .font(.headline)
+        } icon: {
+            Image(systemName: "\(number).circle.fill")
+                .foregroundStyle(ThreadLightTheme.accentForeground)
         }
     }
 }
 
 struct PackagePreparationSettingsView: View {
+    private static let maxRangeDays = 180
+
+    private static let scriptDateFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.calendar = Calendar(identifier: .gregorian)
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "yyyy-MM-dd"
+        return formatter
+    }()
+
     @Environment(AppModel.self) private var model
+    @State private var archiveURLs: [URL] = []
+    @State private var isDropTargeted = false
+    @State private var isPackaging = false
+    @State private var packageTask: Task<Void, Never>?
+    @State private var toDate = Date()
+    @State private var fromDate = Calendar.current.date(byAdding: .day, value: -30, to: Date()) ?? Date()
+    @State private var copiedScript = false
 
     var body: some View {
         @Bindable var model = model
@@ -217,7 +235,7 @@ struct PackagePreparationSettingsView: View {
                 Label("Prepare Encrypted Packages", systemImage: "shippingbox.and.arrow.backward.fill")
                     .font(.title2.bold())
                     .foregroundStyle(ThreadLightTheme.accentForeground)
-                Text("Attach one or more Slack export ZIPs to a legal hold, then save one encrypted package for transfer.")
+                Text("Run a Slack export for a legal hold's custodians, then attach the resulting ZIPs to one encrypted package for transfer.")
                     .font(.callout)
                     .foregroundStyle(.secondary)
             }
@@ -239,55 +257,212 @@ struct PackagePreparationSettingsView: View {
                     Text("Slack did not return any active legal holds for this account.")
                 }
             } else {
-                Form {
-                    Section("Legal hold") {
-                        Picker("Hold", selection: selectedHoldID) {
-                            ForEach(activeHolds) { hold in
-                                Text(hold.name).tag(hold.id)
+                VStack(spacing: 0) {
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 18) {
+                            setupSection(number: 1, title: "Choose the legal hold") {
+                                Text("Pick the hold this export script and package are for.")
+                                    .foregroundStyle(.secondary)
+                                Picker("Hold", selection: selectedHoldID) {
+                                    ForEach(activeHolds) { hold in
+                                        Text(hold.name).tag(hold.id)
+                                    }
+                                }
+                                .disabled(isPackaging)
+                            }
+
+                            setupSection(number: 2, title: "Choose the date range") {
+                                Text("Slack exports cover at most \(Self.maxRangeDays) days at a time.")
+                                    .foregroundStyle(.secondary)
+                                HStack(spacing: 24) {
+                                    DatePicker("From", selection: $fromDate, in: minFromDate...toDate, displayedComponents: .date)
+                                    DatePicker("To", selection: $toDate, in: fromDate...Date(), displayedComponents: .date)
+                                }
+                                .datePickerStyle(.compact)
+                                .frame(maxWidth: 420, alignment: .leading)
+                            }
+
+                            setupSection(number: 3, title: "Copy the export script") {
+                                Text("This script exports every person on this hold for the dates above, then runs itself — nothing else to call by hand.")
+                                    .foregroundStyle(.secondary)
+
+                                if model.custodians.isEmpty {
+                                    Text("No members were found for this hold yet, so there's nothing to generate a script for.")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                } else {
+                                    HStack {
+                                        Button {
+                                            NSPasteboard.general.clearContents()
+                                            NSPasteboard.general.setString(exportScriptText, forType: .string)
+                                            copiedScript = true
+                                        } label: {
+                                            Label(copiedScript ? "Script copied" : "Copy script", systemImage: copiedScript ? "checkmark" : "doc.on.doc")
+                                        }
+                                        .buttonStyle(.borderedProminent)
+                                        .tint(ThreadLightTheme.violet)
+                                        Button("Save Script…", systemImage: "square.and.arrow.down") {
+                                            model.saveSlackExportScript(exportScriptText)
+                                        }
+                                        Text("\(model.custodians.count) custodian(s)")
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                    }
+
+                                    Divider()
+
+                                    Instruction(number: 1, text: "Open your organization's Slack exports page below, signed in as an Org Owner.")
+                                    Group {
+                                        if let exportsPageURL {
+                                            Link(exportsPageURL.absoluteString, destination: exportsPageURL)
+                                        } else {
+                                            Text("https://app.slack.com/manage/YOUR_ORG_ID/security/exports")
+                                                .foregroundStyle(.secondary)
+                                        }
+                                    }
+                                    .font(.system(.callout, design: .monospaced))
+                                    .padding(.leading, 31)
+
+                                    Instruction(number: 2, text: "Open the browser console — in Chrome, press ⌥⌘J (Option + Command + J).")
+                                    Instruction(number: 3, text: "Paste the script (⌘V) and press Return.")
+                                    Instruction(number: 4, text: "If it prints a reminder that it's waiting, click into the page (e.g. its search box) and leave the console open.")
+                                    Instruction(number: 5, text: "There's a short pause between each person to avoid Slack's rate limits — larger holds take longer to finish.")
+                                    Instruction(number: 6, text: "When it's done, the console prints THREADLIGHT EXPORT COMPLETE. Search the output for that line, and check the printed table for any ❌ rows to retry.")
+                                }
+                            }
+
+                            setupSection(number: 4, title: "Download the exports") {
+                                Text("Slack prepares each export in the background, on the same exports page.")
+                                    .foregroundStyle(.secondary)
+                                Instruction(number: 1, text: "Open the Downloads tab on that page.")
+                                Instruction(number: 2, text: "Wait until every custodian's export shows as ready.")
+                                Instruction(number: 3, text: "Download each one — they save as ZIP files.")
+                                Instruction(number: 4, text: "Drag them all into the area below.")
+                            }
+
+                            setupSection(number: 5, title: "Add the export ZIPs") {
+                                Text("Always available — drop files here any time, including ones from a previous run.")
+                                    .foregroundStyle(.secondary)
+
+                                VStack(spacing: 14) {
+                                    Image(systemName: isDropTargeted ? "arrow.down.doc.fill" : "doc.zipper")
+                                        .font(.system(size: 48))
+                                        .foregroundStyle(ThreadLightTheme.accentForeground)
+                                    Text("Drop Slack export ZIPs here")
+                                        .font(.title3.bold())
+                                    Text("Add one or more ZIP files for this legal hold.")
+                                        .foregroundStyle(.secondary)
+                                    Button("Choose ZIP files…", systemImage: "folder") {
+                                        chooseArchives()
+                                    }
+                                    .buttonStyle(.bordered)
+                                    .disabled(isPackaging)
+                                }
+                                .frame(maxWidth: .infinity, minHeight: 230)
+                                .background(
+                                    RoundedRectangle(cornerRadius: 14)
+                                        .fill(ThreadLightTheme.violet.opacity(isDropTargeted ? 0.14 : 0.06))
+                                )
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 14)
+                                        .stroke(
+                                            ThreadLightTheme.violet.opacity(isDropTargeted ? 0.9 : 0.35),
+                                            style: StrokeStyle(lineWidth: isDropTargeted ? 2 : 1, dash: [7])
+                                        )
+                                )
+                                .dropDestination(for: URL.self) { urls, _ in
+                                    add(urls)
+                                } isTargeted: {
+                                    isDropTargeted = $0
+                                }
+
+                                if !archiveURLs.isEmpty {
+                                    VStack(alignment: .leading, spacing: 8) {
+                                        Text("ZIP files (\(archiveURLs.count))")
+                                            .font(.headline)
+                                        ForEach(archiveURLs, id: \.standardizedFileURL) { url in
+                                            HStack {
+                                                Image(systemName: "doc.zipper")
+                                                    .foregroundStyle(ThreadLightTheme.accentForeground)
+                                                Text(url.lastPathComponent)
+                                                    .lineLimit(1)
+                                                Spacer()
+                                                Button("Remove", systemImage: "xmark") {
+                                                    archiveURLs.removeAll { $0.standardizedFileURL == url.standardizedFileURL }
+                                                }
+                                                .labelStyle(.iconOnly)
+                                                .buttonStyle(.plain)
+                                                .disabled(isPackaging)
+                                            }
+                                            .padding(.horizontal, 12)
+                                            .padding(.vertical, 9)
+                                            .threadLightCard()
+                                        }
+                                    }
+                                }
+
+                                Text("ThreadLight normalizes the ZIPs locally. The encrypted package opens only while the same legal hold and member list are available in Slack.")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
                             }
                         }
-                        if let hold = model.selectedHold, !hold.summary.isEmpty {
-                            Text(hold.summary)
-                                .foregroundStyle(.secondary)
-                        }
+                        .padding(20)
                     }
 
-                    Section("Create package") {
-                        Button("Add Slack export ZIPs…", systemImage: "doc.zipper") {
-                            model.presentImportPanel()
+                    Divider()
+
+                    HStack(spacing: 12) {
+                        Spacer()
+                        if isPackaging {
+                            ProgressView()
+                                .controlSize(.small)
                         }
-                        Button("Save encrypted package…", systemImage: "lock.doc") {
-                            model.chooseHoldTransferDestination()
+                        Button {
+                            savePackage()
+                        } label: {
+                            Label(isPackaging ? "Creating encrypted package…" : "Save encrypted package…", systemImage: "lock.doc")
                         }
-                        Text("ThreadLight normalizes the ZIPs locally. The encrypted package opens only while the same legal hold and member list are available in Slack.")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
+                        .buttonStyle(.borderedProminent)
+                        .tint(ThreadLightTheme.violet)
+                        .controlSize(.large)
+                        .disabled(archiveURLs.isEmpty || isPackaging)
+                        Spacer()
                     }
+                    .padding(16)
+                    .background(.bar)
                 }
-                .formStyle(.grouped)
             }
         }
         .onAppear {
-            if model.selectedHold?.status != .active, let first = activeHolds.first {
-                model.sidebarSelection = .hold(first.id)
+            if let newest = activeHolds.first, model.selectedHold?.id != newest.id {
+                model.sidebarSelection = .hold(newest.id)
             }
         }
-        .sheet(isPresented: $model.isShowingImport) {
-            if let hold = model.selectedHold {
-                HoldArchiveIntakeSheet(hold: hold)
-            }
+        .onChange(of: model.selectedHold?.id) {
+            packageTask?.cancel()
+            archiveURLs.removeAll()
+            isPackaging = false
+            copiedScript = false
         }
-        .alert("Slack exports imported", isPresented: $model.isShowingImportReport) {
-            Button("OK", role: .cancel) {}
-        } message: {
-            if let report = model.lastImportReport {
-                Text("Imported \(report.messagesImported) messages and found \(report.filesReferenced) file references.")
-            }
+        .onChange(of: toDate) {
+            if fromDate > toDate { fromDate = toDate }
+            if fromDate < minFromDate { fromDate = minFromDate }
+            copiedScript = false
         }
+        .onChange(of: fromDate) {
+            if toDate < fromDate { toDate = fromDate }
+            copiedScript = false
+        }
+        .onDisappear { packageTask?.cancel() }
     }
 
     private var activeHolds: [LegalHold] {
-        model.holds.filter { $0.status == .active }
+        model.holds
+            .filter { $0.status == .active }
+            .sorted {
+                if $0.createdAt == $1.createdAt { return $0.id < $1.id }
+                return $0.createdAt > $1.createdAt
+            }
     }
 
     private var selectedHoldID: Binding<String> {
@@ -295,6 +470,66 @@ struct PackagePreparationSettingsView: View {
             get: { model.selectedHold?.id ?? activeHolds.first?.id ?? "" },
             set: { model.sidebarSelection = .hold($0) }
         )
+    }
+
+    private var minFromDate: Date {
+        Calendar.current.date(byAdding: .day, value: -Self.maxRangeDays, to: toDate) ?? toDate
+    }
+
+    private var exportsPageURL: URL? {
+        guard let organizationID = model.selectedHold?.organizationID,
+              !organizationID.isEmpty, organizationID != "unknown" else { return nil }
+        return URL(string: "https://app.slack.com/manage/\(organizationID)/security/exports")
+    }
+
+    private var exportScriptText: String {
+        SlackExportScript.build(
+            custodianIDs: model.custodians.map(\.id),
+            startDate: Self.scriptDateFormatter.string(from: fromDate),
+            endDate: Self.scriptDateFormatter.string(from: toDate)
+        )
+    }
+
+    private func chooseArchives() {
+        let panel = NSOpenPanel()
+        panel.title = "Choose Slack export ZIP files"
+        panel.allowedContentTypes = [.zip]
+        panel.allowsMultipleSelection = true
+        panel.canChooseDirectories = false
+        if panel.runModal() == .OK {
+            _ = add(panel.urls)
+        }
+    }
+
+    @discardableResult
+    private func add(_ urls: [URL]) -> Bool {
+        var existing = Set(archiveURLs.map(\.standardizedFileURL))
+        let zips = urls.filter { $0.pathExtension.lowercased() == "zip" }
+        let additions = zips.filter { existing.insert($0.standardizedFileURL).inserted }
+        archiveURLs.append(contentsOf: additions)
+        return !additions.isEmpty
+    }
+
+    private func savePackage() {
+        guard let destination = model.chooseHoldTransferDestination() else { return }
+        let urls = archiveURLs
+        isPackaging = true
+        packageTask = Task {
+            let imported = await model.importHoldArchives(
+                urls: urls,
+                operatorBinding: NSFullUserName(),
+                showReport: false
+            )
+            guard imported, !Task.isCancelled else {
+                isPackaging = false
+                return
+            }
+            let exported = await model.exportHoldTransfer(to: destination)
+            if exported, !Task.isCancelled {
+                archiveURLs.removeAll()
+            }
+            isPackaging = false
+        }
     }
 }
 

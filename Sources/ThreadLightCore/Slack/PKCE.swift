@@ -35,6 +35,8 @@ public enum SlackOAuth {
     /// where they copy it back into ThreadLight. The PKCE verifier never leaves this Mac,
     /// so the code is useless to anything that merely observes the URL.
     public static let redirectURI = "https://callback.threadlight.invalid/oauth/callback"
+    public static let requiredUserScopes: Set<String> = ["admin.legal_holds:read", "users:read", "users:read.email", "reactions:read", "emoji:read"]
+    public static let requestedUserScopes = "admin.legal_holds:read,users:read,users:read.email,reactions:read,emoji:read"
 }
 
 public struct OAuthAttempt: Sendable {
@@ -56,7 +58,7 @@ public struct OAuthAttempt: Sendable {
         components.queryItems = [
             .init(name: "client_id", value: clientID),
             .init(name: "scope", value: "team:read"),
-            .init(name: "user_scope", value: "admin.legal_holds:read"),
+            .init(name: "user_scope", value: SlackOAuth.requestedUserScopes),
             .init(name: "redirect_uri", value: redirectURI),
             .init(name: "code_challenge", value: pkce.challenge),
             .init(name: "code_challenge_method", value: "S256"),

@@ -23,6 +23,10 @@ public enum SlackAppManifest {
           - team:read
         user:
           - admin.legal_holds:read
+          - users:read
+          - users:read.email
+          - reactions:read
+          - emoji:read
       pkce_enabled: true
     settings:
       org_deploy_enabled: true

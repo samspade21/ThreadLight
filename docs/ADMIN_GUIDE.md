@@ -19,7 +19,7 @@ You need:
 4. Choose **Create New App → From an app manifest**.
 5. Choose a workspace in the target organization, select **YAML**, paste the manifest, and create the app.
 
-Use the manifest unchanged. It contains organization deployment, PKCE, `https://callback.threadlight.invalid/oauth/callback`, bot scope `team:read`, and user scope `admin.legal_holds:read`. ThreadLight never needs the Client Secret.
+Use the manifest unchanged. It contains organization deployment, PKCE, `https://callback.threadlight.invalid/oauth/callback`, bot scope `team:read`, and read-only user scopes `admin.legal_holds:read`, `users:read`, `users:read.email`, `reactions:read`, and `emoji:read`. These supply legal holds, current profiles, live reactions, and workspace emoji. ThreadLight never needs the Client Secret.
 
 ## 2. Enter the app details
 
