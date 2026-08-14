@@ -273,8 +273,8 @@ public actor SlackLegalHoldClient: LegalHoldClient {
                       let id = row["entity_id"] as? String else { return nil }
                 let profile = row["profile"] as? [String: Any]
                 let name = (profile?["real_name"] as? String)
-                    ?? (row["name"] as? String)
                     ?? (profile?["display_name"] as? String)
+                    ?? (row["name"] as? String)
                     ?? id
                 let avatarURL = ["image_72", "image_192", "image_512", "image_48"]
                     .compactMap { profile?[$0] as? String }
@@ -304,7 +304,7 @@ public actor SlackLegalHoldClient: LegalHoldClient {
             throw ThreadLightError.slack("Slack returned no profile for this user.", remediation: "The user may no longer be visible to the signed-in Slack account.")
         }
         let profile = user["profile"] as? [String: Any]
-        let displayName = [profile?["display_name"] as? String, profile?["real_name"] as? String, user["real_name"] as? String, user["name"] as? String]
+        let displayName = [profile?["real_name"] as? String, user["real_name"] as? String, profile?["display_name"] as? String, user["name"] as? String]
             .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
             .first { !$0.isEmpty } ?? id
         let avatarURL = ["image_512", "image_192", "image_72", "image_48"]

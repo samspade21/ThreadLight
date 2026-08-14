@@ -117,9 +117,20 @@ struct SlackClientTests {
             )
         }
         let profile = try await SlackLegalHoldClient(accessToken: "token", session: session).userProfile(userID: "U1")
-        #expect(profile.displayName == "Alex Rivera")
+        #expect(profile.displayName == "Alexandra Rivera")
         #expect(profile.email == "alex@example.com")
         #expect(profile.avatarURL == URL(string: "https://avatars.slack-edge.com/live.png"))
+    }
+
+    @Test func userProfileFallsBackToDisplayNameThenHandleWhenNoRealName() async throws {
+        let session = MockURLProtocol.session { request in
+            Self.response(
+                for: request,
+                json: #"{"ok":true,"user":{"id":"U2","name":"jdoe","profile":{"display_name":"JD"}}}"#
+            )
+        }
+        let profile = try await SlackLegalHoldClient(accessToken: "token", session: session).userProfile(userID: "U2")
+        #expect(profile.displayName == "JD")
     }
 
     @Test func reactionsUsesConversationAndTimestampAndReturnsInlineData() async throws {

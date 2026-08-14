@@ -45,7 +45,7 @@ public struct OAuthAttempt: Sendable {
     public let redirectURI: String
     public let authorizationURL: URL
 
-    public static func make(clientID: String, redirectURI: String = SlackOAuth.redirectURI) throws -> OAuthAttempt {
+    public static func make(clientID: String, redirectURI: String = SlackOAuth.redirectURI, organizationID: String? = nil) throws -> OAuthAttempt {
         guard !clientID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw ThreadLightError.invalidConfiguration("Enter the client ID from your organization-owned Slack app.")
         }
@@ -64,6 +64,13 @@ public struct OAuthAttempt: Sendable {
             .init(name: "code_challenge_method", value: "S256"),
             .init(name: "state", value: statePair.verifier),
         ]
+        // Pins the browser's org/workspace picker to the org this Mac's MDM profile expects,
+        // instead of leaving it to whichever org happens to be active in the person's browser
+        // session — a mismatch there silently yields a workspace-scoped token that Slack's
+        // admin.legalHold.* API then rejects with not_allowed_token_type.
+        if let organizationID = organizationID?.trimmingCharacters(in: .whitespacesAndNewlines), !organizationID.isEmpty {
+            components.queryItems?.append(.init(name: "team", value: organizationID))
+        }
         guard let url = components.url else {
             throw ThreadLightError.invalidConfiguration("Could not create the Slack authorization URL.")
         }

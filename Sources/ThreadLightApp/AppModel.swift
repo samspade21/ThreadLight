@@ -243,7 +243,7 @@ final class AppModel {
                 )
             }
             setup.save()
-            let attempt = try OAuthAttempt.make(clientID: setup.slackClientID)
+            let attempt = try OAuthAttempt.make(clientID: setup.slackClientID, organizationID: setup.expectedOrganizationID)
             pendingSignIn = attempt
             NSWorkspace.shared.open(attempt.authorizationURL)
             statusMessage = "Approve ThreadLight in the browser, then paste the address of the final page below."
