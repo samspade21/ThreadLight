@@ -580,6 +580,26 @@ import ZIPFoundation
     #expect(try await fixture.store.search(holdID: fixture.hold.id, query: .init(text: "invalid timestamp")).isEmpty)
 }
 
+@Test func directMessagesSharingOneResolvableParticipantStayDistinct() async throws {
+    let fixture = try StoreFixture()
+    defer { fixture.cleanup() }
+    try await fixture.store.save(hold: fixture.hold)
+    try await fixture.store.replaceCustodians([fixture.custodian], holdID: fixture.hold.id)
+    let zip = try fixture.makeCollidingDirectMessageExport()
+    let report = try await SlackExportImporter(store: fixture.store).importHoldArchive(
+        url: zip,
+        hold: fixture.hold,
+        operatorBinding: "Legal Reviewer"
+    )
+    // Both DMs render as "Tim Miller". Keying conversations on that display name rejected the
+    // whole ZIP as ambiguous metadata, so neither message could be imported.
+    #expect(report.messagesImported == 2)
+    #expect(try await fixture.store.search(holdID: fixture.hold.id, query: .init(text: "first direct")).count == 1)
+    #expect(try await fixture.store.search(holdID: fixture.hold.id, query: .init(text: "second direct")).count == 1)
+    let conversations = try await fixture.store.conversations(holdID: fixture.hold.id)
+    #expect(Set(conversations.map(\.id)).isSuperset(of: ["D1", "D2"]))
+}
+
 @Test func streamingJSONArrayParserHandlesChunkBoundariesEscapesAndNesting() throws {
     let data = Data(#"[{"text":"brace } [ and quote \" and snowman ☃","nested":[{"ok":true}]},{"text":"second"}]"#.utf8)
     var parser = JSONArrayObjectParser(maximumObjectBytes: 1_024 * 1_024)
@@ -1489,6 +1509,30 @@ private final class StoreFixture: @unchecked Sendable {
         try #"[{"user":"U1","text":"enterprise export message","ts":"1785542400.000100","files":[{"id":"F1","name":"linked.txt","size":-1}]},{"user":"U1","text":"invalid timestamp","ts":"NaN"}]"#.write(to: channel.appending(path: "2026-08-01.json"), atomically: true, encoding: .utf8)
         try #"[{"user":"U1","text":"injected auxiliary record","ts":"1785542400.000200"}]"#.write(to: auxiliary.appending(path: "2026-08-01.json"), atomically: true, encoding: .utf8)
         let zip = root.appending(path: "slack-enterprise-export.zip")
+        try FileManager.default.zipItem(at: source, to: zip, shouldKeepParent: false)
+        return zip
+    }
+
+    /// Two direct messages whose only resolvable participant is the same person, which is what
+    /// a hold-wide export looks like when the other side of each DM is absent from the users
+    /// file. Their folders are named by conversation id, as Slack names DM folders.
+    func makeCollidingDirectMessageExport() throws -> URL {
+        let source = root.appending(path: "slack-dm-collision", directoryHint: .isDirectory)
+        let first = source.appending(path: "D1", directoryHint: .isDirectory)
+        let second = source.appending(path: "D2", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: first, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: second, withIntermediateDirectories: true)
+        try #"[{"id":"U1","team_id":"E1","name":"tmiller","profile":{"real_name":"Tim Miller"}}]"#
+            .write(to: source.appending(path: "org_users.json"), atomically: true, encoding: .utf8)
+        try #"[{"id":"C1","name":"general"}]"#
+            .write(to: source.appending(path: "channels.json"), atomically: true, encoding: .utf8)
+        try #"[{"id":"D1","members":["U1","U-GONE-1"]},{"id":"D2","members":["U1","U-GONE-2"]}]"#
+            .write(to: source.appending(path: "dms.json"), atomically: true, encoding: .utf8)
+        try #"[{"user":"U1","text":"first direct message","ts":"1785542400.000100"}]"#
+            .write(to: first.appending(path: "2026-08-01.json"), atomically: true, encoding: .utf8)
+        try #"[{"user":"U1","text":"second direct message","ts":"1785542400.000200"}]"#
+            .write(to: second.appending(path: "2026-08-01.json"), atomically: true, encoding: .utf8)
+        let zip = root.appending(path: "slack-dm-collision-export.zip")
         try FileManager.default.zipItem(at: source, to: zip, shouldKeepParent: false)
         return zip
     }

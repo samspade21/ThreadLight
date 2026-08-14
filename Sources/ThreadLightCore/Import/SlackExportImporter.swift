@@ -349,7 +349,13 @@ public struct SlackExportImporter: Sendable {
                         if name.isEmpty { name = id }
                     }
                     let descriptor = ConversationDescriptor(id: id, name: name, kind: kind)
-                    let localKeys = [name, id, row["name"] as? String].compactMap { $0 }
+                    // These keys resolve a message folder inside the ZIP, and Slack names those
+                    // folders after the conversation id or its literal name/slug. The readable
+                    // participant list above is a display name, never a folder, and it is not
+                    // unique: a member missing from the users file drops out of the join, so
+                    // several distinct DMs collapse onto one remaining name. Keying on it made
+                    // those exports fail to import as ambiguous metadata.
+                    let localKeys = [id, row["name"] as? String].compactMap { $0 }
                     let keys = base.isEmpty ? localKeys : localKeys.map { base + "/" + $0 }
                     for key in keys {
                         if let existing = result[key],

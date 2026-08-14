@@ -139,8 +139,12 @@ private struct ThreadLightCommands: Commands {
     var body: some Commands {
         CommandGroup(after: .appSettings) {
             Divider()
-            Button("Log Out of Slack") { Task { await model?.logOut() } }
-                .disabled(model?.isConnected != true)
+            Button(role: .destructive) {
+                Task { await model?.logOut() }
+            } label: {
+                Label("Log Out of Slack", systemImage: "rectangle.portrait.and.arrow.right")
+            }
+            .disabled(model?.isConnected != true)
         }
         CommandGroup(after: .newItem) {
             Button("Refresh Legal Holds") { Task { await model?.refreshLegalHolds() } }
@@ -404,8 +408,10 @@ private struct ConnectionFooter: View {
 
     var body: some View {
         Menu {
-            Button("Log Out of Slack", role: .destructive) {
+            Button(role: .destructive) {
                 Task { await model.logOut() }
+            } label: {
+                Label("Log Out of Slack", systemImage: "rectangle.portrait.and.arrow.right")
             }
             .disabled(!model.isConnected)
         } label: {
