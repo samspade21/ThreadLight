@@ -25,6 +25,10 @@ if gh release view "$TAG" --repo "$EXPECTED_REPOSITORY" >/dev/null 2>&1; then
 fi
 
 "$PROJECT_DIR/scripts/build-release.sh"
+[[ -z "$(git status --porcelain --untracked-files=normal)" ]] || {
+    print -u2 "The release build changed tracked source. Commit those changes, then run the release again."
+    exit 5
+}
 
 gh release create "$TAG" \
     "$DMG_PATH#ThreadLight $VERSION DMG" \
