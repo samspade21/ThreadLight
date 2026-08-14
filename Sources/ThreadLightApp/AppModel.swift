@@ -719,7 +719,7 @@ final class AppModel {
         let panel = NSSavePanel()
         panel.title = "Save the encrypted legal hold package"
         panel.nameFieldStringValue =
-            "ThreadLight-Hold-\(selectedHold?.name.fileSafePrefix ?? "Export").\(HoldTransferFile.pathExtension)"
+            "ThreadLight-\(selectedHold?.name.fileSafePrefix ?? "Export").\(HoldTransferFile.pathExtension)"
         panel.allowedContentTypes = [UTType(filenameExtension: HoldTransferFile.pathExtension) ?? .data]
         panel.allowsOtherFileTypes = false
         panel.canCreateDirectories = true

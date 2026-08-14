@@ -34,8 +34,6 @@ public struct HoldTransferService: Sendable {
     /// content compress about ten to one, and encrypted output cannot be compressed afterwards,
     /// so an uncompressed payload threw that away and pushed packages toward the size ceiling.
     private static let magic = Data("THREADLIGHT-HOLD-3\n".utf8)
-    /// Earlier formats are recognized only to say so. ThreadLight cannot read them.
-    private static let supersededMagic = Data("THREADLIGHT-HOLD-".utf8)
     private static let saltCount = 32
     private static let maximumBytes = 2 * 1_024 * 1_024 * 1_024
     /// OWASP's PBKDF2-HMAC-SHA256 floor. Derived once per transfer, not once per candidate hold.
@@ -88,9 +86,6 @@ public struct HoldTransferService: Sendable {
             throw ThreadLightError.archive("This is not a supported ThreadLight hold transfer.")
         }
         guard header.starts(with: magic) else {
-            if header.starts(with: supersededMagic) {
-                throw ThreadLightError.archive("This hold transfer was created by an older ThreadLight build. Ask the sender to create a new package.")
-            }
             throw ThreadLightError.archive("This is not a supported ThreadLight hold transfer.")
         }
         return header[header.startIndex + magic.count] == 1
@@ -109,9 +104,6 @@ public struct HoldTransferService: Sendable {
         }
         let data = try Data(contentsOf: url, options: [.mappedIfSafe])
         guard data.starts(with: Self.magic) else {
-            if data.starts(with: Self.supersededMagic) {
-                throw ThreadLightError.archive("This hold transfer was created by an older ThreadLight build. Ask the sender to create a new package.")
-            }
             throw ThreadLightError.archive("This is not a supported ThreadLight hold transfer.")
         }
         let flagIndex = data.startIndex + Self.magic.count

@@ -652,23 +652,20 @@ import ZIPFoundation
     #expect(try await destination.search(holdID: fixture.hold.id, query: .init(text: "approval")).count == 1)
 }
 
-@Test func supersededHoldTransferFormatsSaySoRatherThanLookingCorrupt() async throws {
+@Test func packagesFromEarlierFormatsAreRejected() async throws {
     let fixture = try StoreFixture()
     defer { fixture.cleanup() }
     let url = fixture.root.appending(path: "old.threadlight")
-    // A package from an earlier format version. ThreadLight cannot read it, but recognizing the
-    // prefix is what turns "this is not a ThreadLight file" into "ask for a new package".
+    // Only the current format is readable, so an earlier one is refused like any other file
+    // that is not a ThreadLight transfer.
     var package = Data("THREADLIGHT-HOLD-2\n".utf8)
     package.append(0)
     package.append(Data(repeating: 3, count: 64))
     try package.write(to: url)
 
     #expect(throws: ThreadLightError.self) { _ = try HoldTransferService.requiresPassphrase(url: url) }
-    do {
+    await #expect(throws: ThreadLightError.self) {
         _ = try await HoldTransferService(store: fixture.store).importTransfer(url: url, candidates: [])
-        Issue.record("An earlier package format should not import.")
-    } catch let error as ThreadLightError {
-        #expect(error.errorDescription?.contains("older ThreadLight build") == true)
     }
 }
 
