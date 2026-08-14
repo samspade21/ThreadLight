@@ -93,8 +93,15 @@ public struct SlackExportImporter: Sendable {
         let sha256 = try SHA256Digest.file(url: url)
         if let existing = try await store.sourceArchive(sha256: sha256, holdID: hold.id) {
             if existing.custodianID == custodian.id {
-                throw ThreadLightError.archive("This exact ZIP is already bound to this custodian and hold.")
+                // Identical bytes already recorded for this custodian and hold. The same export
+                // is routinely staged twice under two file names, so callers importing a batch
+                // skip this rather than losing the whole run.
+                throw ThreadLightError.duplicateArchive(
+                    "This ZIP has the same contents as \(existing.originalFilename), which is already imported for this hold."
+                )
             }
+            // Two custodians claiming one set of bytes is an evidence-integrity problem, not a
+            // convenience duplicate, so it still stops the import.
             throw ThreadLightError.archive("This exact ZIP is already bound to another custodian on this hold. Choose that custodian's own untouched export.")
         }
         let users = try parseUsers(archive: archive, entries: entries)

@@ -518,6 +518,10 @@ public enum ThreadLightError: LocalizedError, Sendable {
     case authentication(String)
     case slack(String, remediation: String)
     case archive(String)
+    /// A ZIP whose contents were already imported for this hold. Distinct from `archive` so a
+    /// batch import can skip it instead of failing, since the same export is often staged twice
+    /// under two file names.
+    case duplicateArchive(String)
     case database(String)
     case scope(String)
     case export(String)
@@ -525,7 +529,8 @@ public enum ThreadLightError: LocalizedError, Sendable {
     public var errorDescription: String? {
         switch self {
         case let .invalidConfiguration(message), let .authentication(message), let .archive(message),
-             let .database(message), let .scope(message), let .export(message): message
+             let .duplicateArchive(message), let .database(message), let .scope(message),
+             let .export(message): message
         case let .slack(message, _): message
         }
     }

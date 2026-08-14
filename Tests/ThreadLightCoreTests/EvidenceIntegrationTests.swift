@@ -580,6 +580,50 @@ import ZIPFoundation
     #expect(try await fixture.store.search(holdID: fixture.hold.id, query: .init(text: "invalid timestamp")).isEmpty)
 }
 
+@Test func renamedCopyOfAnImportedExportIsReportedAsADuplicate() async throws {
+    let fixture = try StoreFixture()
+    defer { fixture.cleanup() }
+    try await fixture.store.save(hold: fixture.hold)
+    try await fixture.store.replaceCustodians([fixture.custodian], holdID: fixture.hold.id)
+    let zip = try fixture.makeSlackExport()
+    // The same export saved under a second name, as a browser does with "export (1).zip".
+    let renamed = fixture.root.appending(path: "Slack export (1).zip")
+    try FileManager.default.copyItem(at: zip, to: renamed)
+    let importer = SlackExportImporter(store: fixture.store)
+    let first = try await importer.importHoldArchive(
+        url: zip,
+        hold: fixture.hold,
+        operatorBinding: "Legal Reviewer"
+    )
+    #expect(first.messagesImported > 0)
+
+    // Distinguishable from a real archive failure so a batch import can skip just this file.
+    await #expect(throws: ThreadLightError.self) {
+        _ = try await importer.importHoldArchive(
+            url: renamed,
+            hold: fixture.hold,
+            operatorBinding: "Legal Reviewer"
+        )
+    }
+    do {
+        _ = try await importer.importHoldArchive(
+            url: renamed,
+            hold: fixture.hold,
+            operatorBinding: "Legal Reviewer"
+        )
+        Issue.record("A renamed copy of an imported export should not import twice.")
+    } catch let error as ThreadLightError {
+        guard case .duplicateArchive = error else {
+            Issue.record("Expected duplicateArchive, got \(error)")
+            return
+        }
+    }
+
+    // The renamed copy contributed nothing, so the hold still holds exactly one archive.
+    let archives = try await fixture.store.archives(holdID: fixture.hold.id)
+    #expect(archives.count == 1)
+}
+
 @Test func directMessagesSharingOneResolvableParticipantStayDistinct() async throws {
     let fixture = try StoreFixture()
     defer { fixture.cleanup() }

@@ -547,6 +547,7 @@ final class AppModel {
         importProgress = nil
         defer { importProgress = nil }
         var imported = 0
+        var skipped = 0
         var messageCount = 0
         var warningCount = 0
         ThreadLightLog.importer.notice("import started: archives=\(urls.count, privacy: .public)")
@@ -561,11 +562,26 @@ final class AppModel {
                 ThreadLightLog.importer.info(
                     "archive \(index + 1, privacy: .public)/\(urls.count, privacy: .public) started, scoped=\(access, privacy: .public)"
                 )
-                let report = try await importer.importHoldArchive(
-                    url: url,
-                    hold: hold,
-                    operatorBinding: operatorBinding
-                )
+                let report: ImportReport
+                do {
+                    report = try await importer.importHoldArchive(
+                        url: url,
+                        hold: hold,
+                        operatorBinding: operatorBinding
+                    )
+                } catch let error as ThreadLightError {
+                    // The same export staged twice under two names is expected, not a failure.
+                    // Its evidence is already in the store, so skip it and keep the batch going.
+                    guard case .duplicateArchive = error else { throw error }
+                    skipped += 1
+                    ThreadLightLog.importer.notice(
+                        """
+                        archive \(index + 1, privacy: .public)/\(urls.count, privacy: .public) \
+                        skipped: contents already imported for this hold
+                        """
+                    )
+                    continue
+                }
                 imported += 1
                 messageCount += report.messagesImported
                 warningCount += report.warnings.count
@@ -581,16 +597,23 @@ final class AppModel {
                 )
             }
             isShowingImportReport = showReport
-            hasImportedPackage = imported > 0
+            // A skipped duplicate still means this hold holds that evidence.
+            hasImportedPackage = imported + skipped > 0
             setup.update(.exportAccess, state: .ready, message: "Slack export access produced a valid archive.")
             setup.update(.custodianExports, state: .ready, message: "\(imported) hold-wide Slack export ZIP(s) imported.")
-            statusMessage = "Imported \(imported) ZIP file(s) and \(messageCount) normalized message(s)\(warningCount == 0 ? "." : " with \(warningCount) warning(s).")"
+            let skippedNote = skipped == 0
+                ? ""
+                : " Skipped \(skipped) ZIP file(s) whose contents were already imported."
+            statusMessage = "Imported \(imported) ZIP file(s) and \(messageCount) normalized message(s)"
+                + (warningCount == 0 ? "." : " with \(warningCount) warning(s).")
+                + skippedNote
             touchActivity()
             await loadConversations(for: hold)
             await search()
             ThreadLightLog.importer.notice(
                 """
                 import finished: archives=\(imported, privacy: .public) \
+                skipped=\(skipped, privacy: .public) \
                 messages=\(messageCount, privacy: .public) warnings=\(warningCount, privacy: .public)
                 """
             )

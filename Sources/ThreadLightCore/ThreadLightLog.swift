@@ -30,6 +30,7 @@ public enum ThreadLightLog {
         }
         switch threadLight {
         case .archive: return "archive"
+        case .duplicateArchive: return "duplicateArchive"
         case .authentication: return "authentication"
         case .database: return "database"
         case .export: return "export"
