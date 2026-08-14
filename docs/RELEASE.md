@@ -32,7 +32,7 @@ git commit -m 'chore(release): bump version to 0.3.1'
 ```sh
 swift package resolve
 swift test
-./scripts/build-app.sh
+./scripts/build-app.sh --development
 codesign --verify --deep --strict --verbose=2 build/ThreadLight.app
 ./scripts/verify-reproducible-build.sh
 ./scripts/verify-evidence.sh /path/to/package.threadlight-evidence
@@ -59,12 +59,31 @@ Current result on 2026-08-11 (Apple M2 Pro, 32 GB, macOS 26.6.1, Swift 6.3.3) us
 
 Store the Developer ID identity and notary profile in the approved Apple/CI credential store. Never commit them.
 
+Create the notary profile once per maintainer Mac:
+
+```sh
+xcrun notarytool store-credentials <profile> \
+    --apple-id <apple-id> \
+    --team-id <TEAMID> \
+    --password <app-specific-password>
+```
+
+Then record the identity and profile in a gitignored `.signing.env` so release builds pick them up without re-exporting on every invocation. `--release` builds and `build-release.sh` source it; `--development` builds ignore it and stay ad-hoc signed. Environment variables already set always win, so GitHub Actions is unaffected.
+
+```sh
+cp .signing.env.example .signing.env
+$EDITOR .signing.env
+
+./scripts/build-app.sh --release
+./scripts/verify-release-app.sh build/ThreadLight.app
+```
+
+Passing the values inline still works and overrides `.signing.env`:
+
 ```sh
 CODE_SIGN_IDENTITY='Developer ID Application: Example Corp (TEAMID)' \
 NOTARY_PROFILE='threadlight-notary' \
-./scripts/build-app.sh
-
-./scripts/verify-release-app.sh build/ThreadLight.app
+./scripts/build-app.sh --release
 ```
 
 A Developer ID build now requires a notary profile and fails unless Apple's final status is `Accepted`. The release verifier independently requires the Developer ID authority and team, hardened runtime, production-only entitlements, same-team SQLCipher signature, no demo hooks, a valid stapled ticket, and Gatekeeper acceptance. ThreadLight does not emit a merely signed-but-unnotarized production app.
@@ -79,11 +98,10 @@ Install and authenticate GitHub CLI, and configure the Apple notary profile in t
 
 ```sh
 gh auth login
-
-CODE_SIGN_IDENTITY='Developer ID Application: Example Corp (TEAMID)' \
-NOTARY_PROFILE='threadlight-notary' \
 ./scripts/release.sh 0.3.0
 ```
+
+`release.sh` reads `.signing.env` through `build-release.sh`. Inline `CODE_SIGN_IDENTITY` and `NOTARY_PROFILE` still take precedence when set.
 
 `release.sh` is the common local/CI entry point. It calls `build-release.sh`, which resolves dependencies, runs release tests, builds the production app, validates and notarizes it, creates `ThreadLight-0.3.0.dmg`, signs and notarizes the DMG, writes its SHA-256 checksum, and runs final Apple validation. It then uses `gh release create` to create tag `v0.3.0`, generate release notes, and upload both artifacts to `samspade21/ThreadLight`.
 

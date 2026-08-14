@@ -3,7 +3,36 @@ set -euo pipefail
 
 SCRIPT_DIR=${0:A:h}
 PROJECT_DIR=${SCRIPT_DIR:h}
+BUILD_MODE=${THREADLIGHT_BUILD_MODE:-development}
+(( $# <= 1 )) || {
+    print -u2 "Usage: ./scripts/build-app.sh [--development|--release]"
+    exit 2
+}
+case "${1:-}" in
+    --development) BUILD_MODE=development ;;
+    --release) BUILD_MODE=release ;;
+    --help|-h)
+        print "Usage: ./scripts/build-app.sh [--development|--release]"
+        print "  --development  Ad-hoc test build with development-only storage (default)"
+        print "  --release      Developer ID signed and Apple-notarized production build"
+        print "  THREADLIGHT_BUILD_MODE may set the default to development or release"
+        exit 0
+        ;;
+    "") ;;
+    *)
+        print -u2 "Usage: ./scripts/build-app.sh [--development|--release]"
+        exit 2
+        ;;
+esac
+[[ "$BUILD_MODE" == development || "$BUILD_MODE" == release ]] || {
+    print -u2 "THREADLIGHT_BUILD_MODE must be development or release."
+    exit 2
+}
 CONFIGURATION=${CONFIGURATION:-release}
+if [[ "$BUILD_MODE" == release && "$CONFIGURATION" != release ]]; then
+    print -u2 -- "--release requires CONFIGURATION=release."
+    exit 2
+fi
 APP_DIR="$PROJECT_DIR/build/ThreadLight.app"
 CONTENTS_DIR="$APP_DIR/Contents"
 MACOS_DIR="$CONTENTS_DIR/MacOS"
@@ -13,8 +42,21 @@ IDENTITY=${CODE_SIGN_IDENTITY:--}
 VERSION=$(<"$PROJECT_DIR/VERSION")
 "$PROJECT_DIR/scripts/check-version.sh" "$VERSION" >/dev/null
 
-if [[ "$IDENTITY" != "-" && -z "${NOTARY_PROFILE:-}" ]]; then
-    print -u2 "A Developer ID build requires NOTARY_PROFILE; ThreadLight will not emit an unnotarized production app."
+if [[ "$BUILD_MODE" == release ]]; then
+    source "$PROJECT_DIR/scripts/signing-env.sh"
+    IDENTITY=${CODE_SIGN_IDENTITY:--}
+    [[ -n "$IDENTITY" && "$IDENTITY" != "-" ]] || {
+        print -u2 -- "--release requires CODE_SIGN_IDENTITY for a Developer ID Application certificate."
+        print -u2 -- "Set it in .signing.env (see .signing.env.example) or export it."
+        exit 2
+    }
+    [[ -n "${NOTARY_PROFILE:-}" ]] || {
+        print -u2 -- "--release requires NOTARY_PROFILE; ThreadLight will not emit an unnotarized production app."
+        print -u2 -- "Set it in .signing.env (see .signing.env.example) or export it."
+        exit 2
+    }
+elif [[ "$IDENTITY" != "-" ]]; then
+    print -u2 "A development build must use ad-hoc signing. Pass --release for a production build."
     exit 2
 fi
 
@@ -25,7 +67,7 @@ export SWIFTPM_MODULECACHE_OVERRIDE=${SWIFTPM_MODULECACHE_OVERRIDE:-"$CLANG_MODU
 mkdir -p "$CLANG_MODULE_CACHE_PATH"
 
 cd "$PROJECT_DIR"
-if [[ "$IDENTITY" == "-" ]]; then
+if [[ "$BUILD_MODE" == development ]]; then
     swift build --configuration "$CONFIGURATION" -Xswiftc -DTHREADLIGHT_DEVELOPMENT
     BIN_DIR=$(swift build --configuration "$CONFIGURATION" -Xswiftc -DTHREADLIGHT_DEVELOPMENT --show-bin-path)
 else
@@ -53,14 +95,14 @@ for bundle in "$BIN_DIR"/*.bundle; do
 done
 
 ENTITLEMENTS="Config/ThreadLight.entitlements"
-if [[ "$IDENTITY" == "-" ]]; then
+if [[ "$BUILD_MODE" == development ]]; then
     ENTITLEMENTS="Config/ThreadLight.development.entitlements"
 fi
 codesign --force --sign "$IDENTITY" --timestamp --options runtime "$FRAMEWORKS_DIR/SQLCipher.framework"
 codesign --force --sign "$IDENTITY" --timestamp --options runtime --entitlements "$ENTITLEMENTS" "$APP_DIR"
 codesign --verify --deep --strict --verbose=2 "$APP_DIR"
 
-if [[ "$IDENTITY" != "-" ]]; then
+if [[ "$BUILD_MODE" == release ]]; then
     "$PROJECT_DIR/scripts/verify-release-app.sh" --pre-notarization "$APP_DIR"
     NOTARIZATION_ZIP="$PROJECT_DIR/build/ThreadLight-notarization.zip"
     NOTARIZATION_RESULT="$PROJECT_DIR/build/ThreadLight-notarization-result.json"

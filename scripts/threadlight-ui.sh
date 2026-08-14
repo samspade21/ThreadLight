@@ -8,7 +8,7 @@ EXECUTABLE_PATH="$APP_PATH/Contents/MacOS/ThreadLight"
 
 require_app() {
     [[ -x "$EXECUTABLE_PATH" ]] || {
-        print -u2 "Build ThreadLight first: ./scripts/build-app.sh"
+        print -u2 "Build ThreadLight first: ./scripts/build-app.sh --development"
         exit 2
     }
 }

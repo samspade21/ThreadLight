@@ -16,9 +16,9 @@ file_manifest() {
     )
 }
 
-./scripts/build-app.sh >/dev/null
+./scripts/build-app.sh --development >/dev/null
 file_manifest > "$FIRST_MANIFEST"
-./scripts/build-app.sh >/dev/null
+./scripts/build-app.sh --development >/dev/null
 file_manifest > "$SECOND_MANIFEST"
 
 if ! diff -u "$FIRST_MANIFEST" "$SECOND_MANIFEST"; then

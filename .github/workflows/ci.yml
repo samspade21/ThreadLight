@@ -24,7 +24,7 @@ jobs:
         run: swift --version
 
       - name: Build
-        run: swift build --configuration debug -Xswiftc -DTHREADLIGHT_DEVELOPMENT
+        run: ./scripts/build-app.sh --development
 
       - name: Test
         run: swift test --configuration debug

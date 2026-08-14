@@ -49,13 +49,31 @@ Requirements: macOS 26, Apple Silicon, Xcode 26.6 or later with Swift 6.3.
 ```sh
 swift package resolve
 swift test
-./scripts/build-app.sh
+./scripts/build-app.sh --development
 open build/ThreadLight.app
 ./scripts/verify-reproducible-build.sh
 ./scripts/verify-evidence.sh /path/to/package.threadlight-evidence
 ```
 
-The build script accepts `CODE_SIGN_IDENTITY` and `NOTARY_PROFILE` environment variables. It performs an ad-hoc local signature when no Developer ID identity is supplied. A Developer ID build requires notarization and fails unless Apple accepts it, the ticket staples and validates, production entitlements pass, and Gatekeeper accepts the app. OAuth tokens use ThisDeviceOnly macOS Keychain storage in every build so sessions survive relaunches. Ad-hoc/debug builds write the evidence database key and resource-vault key to plaintext key files under Application Support instead of the Keychain, and sign evidence with ephemeral keys. The key sits beside the database it unlocks, so the encrypted store gives no protection at rest and these builds must never hold real evidence. They show a permanent red banner saying so. Developer ID builds use Keychain and Secure Enclave throughout. Never commit signing credentials.
+Build mode is explicit. `--development` is the default and creates an ad-hoc test build. `--release` creates the real production build and requires `CODE_SIGN_IDENTITY` and `NOTARY_PROFILE`; it fails unless Apple accepts notarization, the ticket staples and validates, production entitlements pass, and Gatekeeper accepts the app. `THREADLIGHT_BUILD_MODE=release` can be used instead of the flag.
+
+On a maintainer Mac, copy `.signing.env.example` to `.signing.env` and fill in the local Developer ID identity and notary profile. `.signing.env` is gitignored, is read only by `--release` builds, and never overrides values already exported in the environment, so CI keeps control.
+
+```sh
+cp .signing.env.example .signing.env
+$EDITOR .signing.env
+./scripts/build-app.sh --release
+```
+
+Without `.signing.env`, pass the values directly:
+
+```sh
+CODE_SIGN_IDENTITY='Developer ID Application: Example Corp (TEAMID)' \
+NOTARY_PROFILE='threadlight-notary' \
+./scripts/build-app.sh --release
+```
+
+OAuth tokens use ThisDeviceOnly macOS Keychain storage in every build so sessions survive relaunches. Development builds write the evidence database key and resource-vault key to plaintext key files under Application Support instead of the Keychain, and sign evidence with ephemeral keys. The key sits beside the database it unlocks, so the encrypted store gives no protection at rest and these builds must never hold real evidence. They show a compact warning at the bottom of the window. Release builds use Keychain and Secure Enclave throughout. Never commit signing credentials.
 
 ## Release maintainers
 

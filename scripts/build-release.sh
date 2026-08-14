@@ -7,19 +7,22 @@ VERSION=$(<"$PROJECT_DIR/VERSION")
 DMG_PATH="$PROJECT_DIR/build/ThreadLight-$VERSION.dmg"
 CHECKSUM_PATH="$DMG_PATH.sha256"
 
+source "$PROJECT_DIR/scripts/signing-env.sh"
 [[ -n "${CODE_SIGN_IDENTITY:-}" && "$CODE_SIGN_IDENTITY" != "-" ]] || {
     print -u2 "A release requires CODE_SIGN_IDENTITY for a Developer ID Application certificate."
+    print -u2 "Set it in .signing.env (see .signing.env.example) or export it."
     exit 2
 }
 [[ -n "${NOTARY_PROFILE:-}" ]] || {
     print -u2 "A release requires NOTARY_PROFILE for xcrun notarytool."
+    print -u2 "Set it in .signing.env (see .signing.env.example) or export it."
     exit 2
 }
 
 cd "$PROJECT_DIR"
 swift package resolve
 swift test --configuration release
-"$PROJECT_DIR/scripts/build-app.sh"
+"$PROJECT_DIR/scripts/build-app.sh" --release
 "$PROJECT_DIR/scripts/package-dmg.sh" "$PROJECT_DIR/build/ThreadLight.app" "$DMG_PATH"
 
 codesign --force --sign "$CODE_SIGN_IDENTITY" --timestamp "$DMG_PATH"

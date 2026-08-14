@@ -53,11 +53,13 @@ private struct WorkspaceWindow: View {
     }
 
     var body: some View {
-        RootView(initialConversation: initialConversation)
-            .environment(model)
-            .focusedSceneValue(\.threadLightModel, model)
-            .frame(minWidth: 1_200, minHeight: 700)
-            .safeAreaInset(edge: .top, spacing: 0) { DevelopmentBuildBanner() }
+        VStack(spacing: 0) {
+            RootView(initialConversation: initialConversation)
+            DevelopmentBuildBanner()
+        }
+        .environment(model)
+        .focusedSceneValue(\.threadLightModel, model)
+        .frame(minWidth: 1_200, minHeight: 700)
     }
 }
 
@@ -69,18 +71,17 @@ struct DevelopmentBuildBanner: View {
         #if THREADLIGHT_DEVELOPMENT
         HStack(spacing: 8) {
             Image(systemName: "exclamationmark.triangle.fill")
-            Text("Development build — the evidence database key is stored unencrypted on disk. Not for real evidence.")
+            Text("Development build — do not use real evidence. Local database keys are unencrypted.")
                 .fontWeight(.semibold)
             Spacer(minLength: 0)
         }
-        .font(.callout)
-        .padding(.horizontal, 16)
-        .padding(.vertical, 8)
-        .frame(maxWidth: .infinity)
-        .background(.red)
+        .font(.caption)
+        .padding(.horizontal, 12)
+        .frame(maxWidth: .infinity, minHeight: 26, maxHeight: 26)
+        .background(Color.red.opacity(0.88))
         .foregroundStyle(.white)
         .accessibilityElement(children: .combine)
-        .accessibilityLabel("Development build. The evidence database key is stored unencrypted on disk. Not for real evidence.")
+        .accessibilityLabel("Development build. Do not use real evidence. Local database keys are unencrypted.")
         #else
         EmptyView()
         #endif
