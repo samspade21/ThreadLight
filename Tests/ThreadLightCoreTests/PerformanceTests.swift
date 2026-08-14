@@ -26,16 +26,15 @@ import ZIPFoundation
         try await store.replaceCustodians([custodian], holdID: hold.id)
     }
 
-    let zipURL: URL
-    if let external = ProcessInfo.processInfo.environment["THREADLIGHT_PERFORMANCE_ARCHIVE"] {
-        zipURL = URL(fileURLWithPath: external)
-    } else {
-        zipURL = root.appending(path: "performance-export.zip")
-        try makeArchive(at: zipURL, messageCount: messageCount)
-    }
-
     var importSeconds = 0.0
     if !reuseDatabase {
+        let zipURL: URL
+        if let external = ProcessInfo.processInfo.environment["THREADLIGHT_PERFORMANCE_ARCHIVE"] {
+            zipURL = URL(fileURLWithPath: external)
+        } else {
+            zipURL = root.appending(path: "performance-export-\(UUID()).zip")
+            try makeArchive(at: zipURL, messageCount: messageCount)
+        }
         let importStarted = Date()
         let report = try await SlackExportImporter(store: store).importArchive(
             url: zipURL,
@@ -48,6 +47,22 @@ import ZIPFoundation
         #expect(report.messagesImported == messageCount)
     }
 
+    let holdOpenStarted = Date()
+    let attachmentsStarted = Date()
+    let attachmentAvailability = try await store.attachmentAvailability(holdID: hold.id)
+    let attachmentSeconds = Date().timeIntervalSince(attachmentsStarted)
+    let conversationsStarted = Date()
+    let conversations = try await store.conversations(holdID: hold.id)
+    let conversationSeconds = Date().timeIntervalSince(conversationsStarted)
+    let initialMessagesStarted = Date()
+    let initialMessages = try await store.search(holdID: hold.id, query: .init(limit: 501))
+    let initialMessageSeconds = Date().timeIntervalSince(initialMessagesStarted)
+    let holdOpenSeconds = Date().timeIntervalSince(holdOpenStarted)
+    #expect(attachmentAvailability == (referenced: 0, available: 0))
+    #expect(conversations.count == 1)
+    #expect(initialMessages.count == min(501, messageCount))
+    #expect(holdOpenSeconds < 2)
+
     let searchStarted = Date()
     let matches = try await store.search(holdID: hold.id, query: .init(text: "needle", limit: 10))
     let searchSeconds = Date().timeIntervalSince(searchStarted)
@@ -57,7 +72,7 @@ import ZIPFoundation
     #expect(getrusage(RUSAGE_SELF, &resourceUsage) == 0)
     let peakResidentBytes = Int64(resourceUsage.ru_maxrss)
     #expect(peakResidentBytes < 1_024 * 1_024 * 1_024)
-    print("ThreadLight performance: \(messageCount) messages; import \(String(format: "%.2f", importSeconds))s; search \(String(format: "%.3f", searchSeconds))s; peak RSS \(peakResidentBytes) bytes; swaps \(resourceUsage.ru_nswap)")
+    print("ThreadLight performance: \(messageCount) messages; import \(String(format: "%.2f", importSeconds))s; hold open \(String(format: "%.3f", holdOpenSeconds))s [attachments \(String(format: "%.3f", attachmentSeconds))s, conversations \(String(format: "%.3f", conversationSeconds))s, messages \(String(format: "%.3f", initialMessageSeconds))s]; search \(String(format: "%.3f", searchSeconds))s; peak RSS \(peakResidentBytes) bytes; swaps \(resourceUsage.ru_nswap)")
 }
 
 private func add(_ data: Data, path: String, to archive: Archive) throws {

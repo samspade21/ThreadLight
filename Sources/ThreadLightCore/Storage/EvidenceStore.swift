@@ -253,33 +253,45 @@ public actor EvidenceStore {
     }
 
     public func attachmentAvailability(holdID: String) throws -> (referenced: Int, available: Int) {
-        let messages: [EvidenceMessage] = try rows(
+        try firstRow(
             """
-            SELECT DISTINCT m.json FROM messages m
-            JOIN memberships hm ON hm.message_id = m.id
-            JOIN source_archives a ON a.id = hm.source_archive_id AND a.complete = 1
-            WHERE hm.hold_id = ?
+            SELECT count(*), count(f.local_relative_path)
+            FROM evidence_files f
+            WHERE EXISTS (
+                SELECT 1
+                FROM memberships hm INDEXED BY idx_memberships_hold
+                JOIN source_archives a ON a.id = hm.source_archive_id AND a.complete = 1
+                WHERE hm.hold_id = ? AND hm.message_id = f.message_id
+            )
             """,
             [.text(holdID)]
         ) { statement in
-            try Self.decoder.decode(EvidenceMessage.self, from: columnData(statement, 0))
-        }
-        let files = messages.flatMap(\.files)
-        return (files.count, files.filter(\.hasOriginalBytes).count)
+            (
+                referenced: Int(sqlite3_column_int64(statement, 0)),
+                available: Int(sqlite3_column_int64(statement, 1))
+            )
+        } ?? (0, 0)
     }
 
     public func conversations(holdID: String) throws -> [EvidenceConversation] {
         guard let hold = try storedHold(id: holdID), hold.status == .active else { return [] }
-        var conditions = ["hm.hold_id = ?"]
+        var conditions = [
+            """
+            EXISTS (
+                SELECT 1
+                FROM memberships hm INDEXED BY idx_memberships_hold
+                JOIN source_archives a ON a.id = hm.source_archive_id AND a.complete = 1
+                WHERE hm.hold_id = ? AND hm.message_id = m.id
+            )
+            """
+        ]
         var values: [SQLiteValue] = [.text(holdID)]
         Self.appendHoldScope(hold, conditions: &conditions, values: &values)
         return try rows(
             """
             SELECT m.conversation_id, m.conversation_name, m.conversation_kind,
-                   count(DISTINCT m.id), max(m.posted_at)
+                   count(*), max(m.posted_at)
             FROM messages m
-            JOIN memberships hm ON hm.message_id = m.id
-            JOIN source_archives a ON a.id = hm.source_archive_id AND a.complete = 1
             WHERE \(conditions.joined(separator: " AND "))
             GROUP BY m.conversation_id, m.conversation_name, m.conversation_kind
             ORDER BY m.conversation_name COLLATE NOCASE, m.conversation_id
@@ -328,6 +340,7 @@ public actor EvidenceStore {
         guard let hold = try storedHold(id: holdID), hold.status == .active else { return [] }
         let parsed = try SearchParser.parse(query)
         let positiveExpression = parsed.expression.flatMap { $0.containsUnaryNot ? nil : $0 }
+        let filters = parsed.filters
         var sql: String
         var conditions: [String]
         var values: [SQLiteValue]
@@ -345,13 +358,25 @@ public actor EvidenceStore {
             values = [.text(positiveExpression.fts5()), .text(holdID)]
         } else {
             sql = """
-            SELECT DISTINCT m.json
+            SELECT m.json
             FROM messages m
-            JOIN memberships hm ON hm.message_id = m.id
-            JOIN source_archives a ON a.id = hm.source_archive_id AND a.complete = 1
             """
-            conditions = ["hm.hold_id = ?"]
+            var membershipConditions = ["hm.hold_id = ?", "hm.message_id = m.id"]
             values = [.text(holdID)]
+            if let custodianID = filters.custodianID {
+                membershipConditions.append("hm.custodian_id = ?")
+                values.append(.text(custodianID))
+            }
+            conditions = [
+                """
+                EXISTS (
+                    SELECT 1
+                    FROM memberships hm INDEXED BY idx_memberships_hold
+                    JOIN source_archives a ON a.id = hm.source_archive_id AND a.complete = 1
+                    WHERE \(membershipConditions.joined(separator: " AND "))
+                )
+                """
+            ]
             if let expression = parsed.expression {
                 let predicate = SearchPredicateCompiler.compile(expression)
                 conditions.append(predicate.sql)
@@ -359,14 +384,16 @@ public actor EvidenceStore {
             }
         }
         Self.appendHoldScope(hold, conditions: &conditions, values: &values)
-        let filters = parsed.filters
         if let sender = filters.sender { conditions.append("m.sender_name LIKE ? ESCAPE '\\'"); values.append(.text("%\(sender.sqlLikeEscaped)%")) }
         if let personID = filters.personID {
             conditions.append("(m.sender_id = ? OR m.text LIKE ? ESCAPE '\\')")
             values.append(.text(personID))
             values.append(.text("%<@\(personID.sqlLikeEscaped)>%"))
         }
-        if let custodianID = filters.custodianID { conditions.append("hm.custodian_id = ?"); values.append(.text(custodianID)) }
+        if let custodianID = filters.custodianID, positiveExpression != nil {
+            conditions.append("hm.custodian_id = ?")
+            values.append(.text(custodianID))
+        }
         if let conversationID = filters.conversationID { conditions.append("m.conversation_id = ?"); values.append(.text(conversationID)) }
         if let conversation = filters.conversation { conditions.append("m.conversation_name LIKE ? ESCAPE '\\'"); values.append(.text("%\(conversation.sqlLikeEscaped)%")) }
         if let after = filters.after { conditions.append("m.posted_at >= ?"); values.append(.double(after.timeIntervalSince1970)) }
@@ -713,6 +740,7 @@ public actor EvidenceStore {
             );
             CREATE INDEX IF NOT EXISTS idx_memberships_hold ON memberships(hold_id, message_id);
             CREATE INDEX IF NOT EXISTS idx_messages_posted ON messages(posted_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_messages_posted_id ON messages(posted_at DESC, id DESC);
             """
         )
         var version = currentVersion

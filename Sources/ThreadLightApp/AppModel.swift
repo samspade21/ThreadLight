@@ -137,6 +137,7 @@ final class AppModel {
     private var requestedConversation: (holdID: String, conversationID: String)?
     private var requestedSlackUserIDs: Set<String> = []
     private var requestedReactionMessageIDs: Set<String> = []
+    private var custodianValidatedAt: [String: Date] = [:]
 
     var visibleHolds: [LegalHold] {
         let filtered = switch holdListFilter {
@@ -340,6 +341,7 @@ final class AppModel {
             slackEmojiURLs = [:]
             requestedSlackUserIDs = []
             requestedReactionMessageIDs = []
+            custodianValidatedAt = [:]
             selectedMessageIDs.removeAll()
             sidebarSelection = .setup
             statusMessage = "Logged out. Local evidence remains encrypted on this Mac."
@@ -426,39 +428,56 @@ final class AppModel {
             await loadCustodians(for: hold)
             guard !Task.isCancelled, selectedHold?.id == hold.id else { return }
             if hasImportedPackage {
-                await loadConversations(for: hold)
                 if requestedConversation?.holdID == hold.id {
                     searchFilters.conversationID = requestedConversation?.conversationID
                     requestedConversation = nil
                 }
                 await search()
+                await loadConversations(for: hold)
             } else {
                 messages = []
                 isSearching = false
                 statusMessage = "Waiting for the encrypted package for \(hold.name)."
             }
+            await refreshCustodiansIfNeeded(for: hold)
         }
     }
 
     func loadCustodians(for hold: LegalHold) async {
         do {
-            var loaded: [Custodian]
-            if hold.status != .active {
-                loaded = try await store?.custodians(holdID: hold.id) ?? []
-            } else if let legalHoldClient {
-                loaded = try await legalHoldClient.listCustodians(policyID: hold.id)
-                _ = try await reconcileCustodians(loaded, for: hold)
-                loaded = try await store?.custodians(holdID: hold.id) ?? loaded
-            } else {
-                loaded = try await store?.custodians(holdID: hold.id) ?? []
-            }
+            let loaded = try await store?.custodians(holdID: hold.id) ?? []
             guard !Task.isCancelled, selectedHold?.id == hold.id else { return }
             custodians = loaded
-            await refreshSlackUserProfiles(for: Set(loaded.map(\.id)))
             try await refreshEvidenceReadiness(for: hold)
+            Task { await refreshSlackUserProfiles(for: Set(loaded.map(\.id)), holdID: hold.id) }
         } catch is CancellationError {
             return
         } catch { show(error) }
+    }
+
+    private func refreshCustodiansIfNeeded(for hold: LegalHold) async {
+        guard hold.status == .active, let legalHoldClient else { return }
+        if let validatedAt = custodianValidatedAt[hold.id],
+           Date().timeIntervalSince(validatedAt) < 300 {
+            return
+        }
+        do {
+            let loaded = try await legalHoldClient.listCustodians(policyID: hold.id)
+            let invalidated = try await reconcileCustodians(loaded, for: hold)
+            guard !Task.isCancelled, selectedHold?.id == hold.id else { return }
+            if invalidated {
+                try await refreshEvidenceReadiness(for: hold)
+                return
+            }
+            let cached = try await store?.custodians(holdID: hold.id) ?? loaded
+            guard !Task.isCancelled, selectedHold?.id == hold.id else { return }
+            custodians = cached
+            Task { await refreshSlackUserProfiles(for: Set(cached.map(\.id)), holdID: hold.id) }
+        } catch is CancellationError {
+            return
+        } catch {
+            show(error)
+        }
     }
 
     /// Prefers a live-fetched Slack profile name, then the custodian's own stored name, then a
@@ -1439,9 +1458,15 @@ final class AppModel {
         }
     }
 
-    private func refreshSlackUserProfiles(for userIDs: Set<String>, retryFailures: Bool = true) async {
+    private func refreshSlackUserProfiles(
+        for userIDs: Set<String>,
+        holdID expectedHoldID: String? = nil,
+        retryFailures: Bool = true
+    ) async {
         guard isConnected, let legalHoldClient else { return }
+        let holdID = expectedHoldID ?? selectedHold?.id
         let missing = userIDs.subtracting(requestedSlackUserIDs)
+        guard !missing.isEmpty else { return }
         requestedSlackUserIDs.formUnion(missing)
         let identifiers = missing.sorted()
         var failed: Set<String> = []
@@ -1464,6 +1489,7 @@ final class AppModel {
                     continue
                 }
                 slackUserProfiles[profile.id] = profile
+                guard selectedHold?.id == holdID else { continue }
                 guard let index = custodians.firstIndex(where: { $0.id == profile.id }) else { continue }
                 custodians[index].displayName = profile.displayName
                 custodians[index].email = profile.email
@@ -1475,9 +1501,9 @@ final class AppModel {
         }
         if !failed.isEmpty, retryFailures, !Task.isCancelled {
             try? await Task.sleep(for: .seconds(1))
-            await refreshSlackUserProfiles(for: failed, retryFailures: false)
+            await refreshSlackUserProfiles(for: failed, holdID: holdID, retryFailures: false)
         }
-        if let holdID = selectedHold?.id, !custodians.isEmpty {
+        if let holdID, selectedHold?.id == holdID, !custodians.isEmpty {
             try? await store?.replaceCustodians(custodians, holdID: holdID)
         }
     }
@@ -1546,7 +1572,10 @@ final class AppModel {
             }
         }
         try await store.save(hold: hold)
-        try await store.replaceCustodians(reconciled, holdID: hold.id)
+        if Set(previous) != Set(reconciled) {
+            try await store.replaceCustodians(reconciled, holdID: hold.id)
+        }
+        custodianValidatedAt[hold.id] = Date()
         return invalidated
     }
 
@@ -1603,6 +1632,7 @@ final class AppModel {
         )
         holdLoadTask?.cancel()
         threadLoadTask?.cancel()
+        custodianValidatedAt = [:]
         store = try await EvidenceStore.openDefault(organizationID: namespace)
         resourceVault = try await ResourceVault.openDefault(organizationID: namespace)
         currentOrganizationID = organizationID == "unconfigured" ? nil : organizationID

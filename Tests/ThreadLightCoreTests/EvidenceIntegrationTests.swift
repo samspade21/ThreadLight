@@ -251,6 +251,11 @@ import ZIPFoundation
     #expect(counts.threads == 1)
     #expect(counts.reactions == 1)
     #expect(counts.files == 1)
+    #expect(try await fixture.store.attachmentAvailability(holdID: fixture.hold.id) == (referenced: 1, available: 0))
+
+    enriched.files[0].localRelativePath = "F1.bin"
+    try await fixture.store.update(message: enriched)
+    #expect(try await fixture.store.attachmentAvailability(holdID: fixture.hold.id) == (referenced: 1, available: 1))
 }
 
 @Test func schemaVersionOneDatabaseMigratesAndBackfillsNormalizedRecords() async throws {
