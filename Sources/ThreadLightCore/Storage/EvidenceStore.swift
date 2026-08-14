@@ -450,40 +450,53 @@ public actor EvidenceStore {
         fingerprint: String
     ) throws -> HoldTransferSnapshot {
         let archives = try archives(holdID: hold.id)
-        let records: [HoldTransferRecord] = try rows(
+        // Each message is serialized once here. Memberships are keyed per source archive, so a
+        // message shared across custodians' exports repeats in the membership list only, which
+        // costs a few identifiers instead of the whole message and its retained raw Slack JSON.
+        let messages: [EvidenceMessage] = try rows(
             """
-            SELECT m.json, hm.hold_id, hm.custodian_id, hm.message_id,
+            SELECT m.json FROM messages m
+            WHERE m.id IN (
+                SELECT hm.message_id FROM memberships hm
+                JOIN source_archives a ON a.id = hm.source_archive_id AND a.complete = 1
+                WHERE hm.hold_id = ?
+            )
+            ORDER BY m.id
+            """,
+            [.text(hold.id)]
+        ) { statement in
+            try Self.decoder.decode(EvidenceMessage.self, from: columnData(statement, 0))
+        }
+        let memberships: [HoldMembership] = try rows(
+            """
+            SELECT hm.hold_id, hm.custodian_id, hm.message_id,
                    hm.source_archive_id, hm.source_message_sha256
             FROM memberships hm
-            JOIN messages m ON m.id = hm.message_id
             JOIN source_archives a ON a.id = hm.source_archive_id AND a.complete = 1
             WHERE hm.hold_id = ?
             ORDER BY hm.source_archive_id, hm.message_id, hm.custodian_id
             """,
             [.text(hold.id)]
         ) { statement in
-            guard let sourceID = UUID(uuidString: columnText(statement, 4)) else {
+            guard let sourceID = UUID(uuidString: columnText(statement, 3)) else {
                 throw ThreadLightError.database("Stored source archive ID is invalid.")
             }
-            return HoldTransferRecord(
-                message: try Self.decoder.decode(EvidenceMessage.self, from: columnData(statement, 0)),
-                membership: .init(
-                    holdID: columnText(statement, 1),
-                    custodianID: columnText(statement, 2),
-                    messageID: columnText(statement, 3),
-                    sourceArchiveID: sourceID,
-                    sourceMessageSHA256: columnText(statement, 5)
-                )
+            return HoldMembership(
+                holdID: columnText(statement, 0),
+                custodianID: columnText(statement, 1),
+                messageID: columnText(statement, 2),
+                sourceArchiveID: sourceID,
+                sourceMessageSHA256: columnText(statement, 4)
             )
         }
         return .init(
-            schemaVersion: 1,
             createdAt: .now,
             holdID: hold.id,
             organizationID: hold.organizationID,
             holdFingerprint: fingerprint,
             archives: archives,
-            records: records
+            messages: messages,
+            memberships: memberships
         )
     }
 
@@ -492,19 +505,23 @@ public actor EvidenceStore {
         hold: LegalHold,
         custodians: [Custodian]
     ) throws -> (archives: Int, messages: Int) {
-        guard snapshot.schemaVersion == 1,
+        guard snapshot.schemaVersion == HoldTransferSnapshot.schemaVersion,
               snapshot.holdID == hold.id,
               snapshot.organizationID == hold.organizationID,
               snapshot.holdFingerprint == HoldAccessKey.fingerprint(hold: hold, custodians: custodians) else {
             throw ThreadLightError.archive("The transfer does not match the current legal hold membership.")
         }
         let sources = Dictionary(uniqueKeysWithValues: snapshot.archives.map { ($0.id, $0) })
+        let messages = Dictionary(snapshot.messages.map { ($0.id, $0) }) { first, _ in first }
         guard sources.count == snapshot.archives.count,
+              messages.count == snapshot.messages.count,
               snapshot.archives.allSatisfy({ $0.holdID == hold.id }),
-              snapshot.records.allSatisfy({
-                  $0.membership.holdID == hold.id
-                    && $0.membership.messageID == $0.message.id
-                    && sources[$0.membership.sourceArchiveID] != nil
+              // Every membership must name a message the package actually carries, or the
+              // transfer claims provenance for evidence it does not contain.
+              snapshot.memberships.allSatisfy({
+                  $0.holdID == hold.id
+                    && messages[$0.messageID] != nil
+                    && sources[$0.sourceArchiveID] != nil
               }) else {
             throw ThreadLightError.archive("The transfer contains inconsistent source provenance.")
         }
@@ -515,9 +532,13 @@ public actor EvidenceStore {
         for archive in snapshot.archives {
             if try sourceArchive(sha256: archive.sha256, holdID: hold.id) != nil { continue }
             try beginImport(archive)
-            let records = snapshot.records
-                .filter { $0.membership.sourceArchiveID == archive.id }
-                .map { EvidenceImportRecord(message: $0.message, membership: $0.membership) }
+            let records = snapshot.memberships
+                .filter { $0.sourceArchiveID == archive.id }
+                .compactMap { membership in
+                    messages[membership.messageID].map {
+                        EvidenceImportRecord(message: $0, membership: membership)
+                    }
+                }
             let counts = try insert(records: records)
             importedMessages += counts.inserted
             try completeImport(archive)

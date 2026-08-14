@@ -182,7 +182,7 @@ public final class SetupCoordinator {
         Confirm approved Slack export access is enabled. In ThreadLight's IT Role, select this hold and attach one or more untouched JSON ZIPs. The current hold members are:
         \(people)
 
-        ThreadLight normalizes the ZIPs and creates one encrypted `.threadlight-hold` file. Deliver that file to Legal out of band. Standard exports may contain file links rather than original attachment bytes.
+        ThreadLight normalizes the ZIPs and creates one encrypted `.threadlight` file. Deliver that file to Legal out of band. Standard exports may contain file links rather than original attachment bytes.
 
         ## Completion checklist
         - [ ] Internal app created

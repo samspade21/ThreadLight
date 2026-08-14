@@ -4,7 +4,7 @@ ThreadLight handles legal hold evidence. The rules below exist because a mistake
 
 ## Never commit real data
 
-Use synthetic fixtures for everything. No Slack exports, evidence databases, OAuth tokens, `.threadlight-hold` packages, screenshots of real conversations, custodian names, member IDs, workspace IDs, or enterprise domains — in code, tests, docs, commit messages, issues, or pull requests.
+Use synthetic fixtures for everything. No Slack exports, evidence databases, OAuth tokens, `.threadlight` packages, screenshots of real conversations, custodian names, member IDs, workspace IDs, or enterprise domains — in code, tests, docs, commit messages, issues, or pull requests.
 
 `Tests/ThreadLightCoreTests` shows the fixture style: invented names like `Alex Rivera`, IDs like `U1`, and placeholder orgs like `acme`. Follow it. `.gitignore` already excludes evidence artifacts, exports, `tmp/`, and signing material, but treat that as a backstop, not a review step.
 

@@ -13,7 +13,7 @@ ThreadLight does not create legal holds or change Slack. Slack remains the syste
 
 1. The Slack administrator installs ThreadLight's supplied app manifest for the Enterprise organization. The app has read-only permissions.
 2. In **Settings → Prepare Packages**, the administrator chooses an active legal hold and drops in one or more untouched Slack export ZIP files.
-3. ThreadLight reads and normalizes those ZIPs on that Mac, then creates one encrypted `.threadlight-hold` file. A passphrase can be added for stronger transfer protection.
+3. ThreadLight reads and normalizes those ZIPs on that Mac, then creates one encrypted `.threadlight` file. A passphrase can be added for stronger transfer protection.
 4. The administrator sends that encrypted file to Legal through the organization's approved transfer channel.
 5. The reviewer signs in to Slack on their own Mac and drops the package into ThreadLight. The app only opens it when it matches a currently active hold and its current members.
 6. The reviewer searches locally by words, person, conversation, attachment, or date. Channels and direct messages stay grouped like Slack.
@@ -29,7 +29,7 @@ ThreadLight does connect directly to **Slack's** cloud for sign-in and for read-
 
 - A signed production build creates a separate random encryption key for each Slack organization and stores that key in the macOS Keychain on that Mac.
 - Searchable message data is stored in an encrypted SQLCipher database. Imported attachment bytes are stored separately with AES-GCM encryption. The app decrypts data only when it needs to display or export it.
-- The `.threadlight-hold` transfer file is encrypted with AES-GCM. Its base key is derived from the Slack organization, the hold, and the hold's current member list. Those identifiers are not written in plaintext inside the package.
+- The `.threadlight` transfer file is encrypted with AES-GCM. Its base key is derived from the Slack organization, the hold, and the hold's current member list. Those identifiers are not written in plaintext inside the package.
 - That base key prevents ordinary accidental access, but Slack administrators who already know all those identifiers may be able to reconstruct it. For confidential transport, add a strong passphrase and share it through a separate approved channel. ThreadLight strengthens the passphrase with PBKDF2 before using it.
 - If Slack reports that the hold disappeared or its member list changed, ThreadLight removes the old local evidence and requires a new package.
 - Optional evidence signatures detect later changes. They do not prove who operated the Mac and are not a trusted timestamp; compare the displayed signer key ID through a separate trusted record.

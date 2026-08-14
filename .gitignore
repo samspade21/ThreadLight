@@ -13,6 +13,7 @@ DerivedData/
 *.evidence.sqlite*
 *.threadlight-case/
 *.threadlight-evidence/
+*.threadlight
 *.threadlight-hold
 *.threadlight-setup-request/
 *.threadlight-setup-response/

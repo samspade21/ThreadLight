@@ -559,7 +559,7 @@ final class AppModel {
                 try Task.checkCancellation()
                 let access = url.startAccessingSecurityScopedResource()
                 defer { if access { url.stopAccessingSecurityScopedResource() } }
-                ThreadLightLog.importer.info(
+                ThreadLightLog.importer.notice(
                     "archive \(index + 1, privacy: .public)/\(urls.count, privacy: .public) started, scoped=\(access, privacy: .public)"
                 )
                 let report: ImportReport
@@ -586,7 +586,7 @@ final class AppModel {
                 messageCount += report.messagesImported
                 warningCount += report.warnings.count
                 lastImportReport = report
-                ThreadLightLog.importer.info(
+                ThreadLightLog.importer.notice(
                     """
                     archive \(index + 1, privacy: .public)/\(urls.count, privacy: .public) done: \
                     messages=\(report.messagesImported, privacy: .public) \
@@ -718,8 +718,9 @@ final class AppModel {
         }
         let panel = NSSavePanel()
         panel.title = "Save the encrypted legal hold package"
-        panel.nameFieldStringValue = "ThreadLight-Hold-\(selectedHold?.name.fileSafePrefix ?? "Export").threadlight-hold"
-        panel.allowedContentTypes = [UTType(filenameExtension: "threadlight-hold") ?? .data]
+        panel.nameFieldStringValue =
+            "ThreadLight-Hold-\(selectedHold?.name.fileSafePrefix ?? "Export").\(HoldTransferFile.pathExtension)"
+        panel.allowedContentTypes = [UTType(filenameExtension: HoldTransferFile.pathExtension) ?? .data]
         panel.allowsOtherFileTypes = false
         panel.canCreateDirectories = true
         panel.prompt = "Export"
@@ -786,7 +787,7 @@ final class AppModel {
         }
         let access = destination.startAccessingSecurityScopedResource()
         defer { if access { destination.stopAccessingSecurityScopedResource() } }
-        ThreadLightLog.transfer.info(
+        ThreadLightLog.transfer.notice(
             "destination scoped=\(access, privacy: .public) passphrase=\(passphrase != nil, privacy: .public)"
         )
         do {

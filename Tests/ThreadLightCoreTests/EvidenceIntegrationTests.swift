@@ -1,4 +1,5 @@
 import AppKit
+import CryptoKit
 import Foundation
 import PDFKit
 import SQLCipher
@@ -440,7 +441,7 @@ import ZIPFoundation
     let source = try StoreFixture()
     defer { source.cleanup() }
     try await source.seed()
-    let transferURL = source.root.appending(path: "case.threadlight-hold")
+    let transferURL = source.root.appending(path: "case.threadlight")
     _ = try await HoldTransferService(store: source.store).export(
         hold: source.hold,
         custodians: [source.custodian],
@@ -478,7 +479,7 @@ import ZIPFoundation
     defer { source.cleanup() }
     try await source.seed()
     let passphrase = "correct horse battery staple"
-    let transferURL = source.root.appending(path: "protected.threadlight-hold")
+    let transferURL = source.root.appending(path: "protected.threadlight")
     _ = try await HoldTransferService(store: source.store).export(
         hold: source.hold,
         custodians: [source.custodian],
@@ -526,12 +527,12 @@ import ZIPFoundation
         _ = try await service.export(
             hold: source.hold,
             custodians: [source.custodian],
-            destination: source.root.appending(path: "short.threadlight-hold"),
+            destination: source.root.appending(path: "short.threadlight"),
             passphrase: "tooshort"
         )
     }
 
-    let openURL = source.root.appending(path: "open.threadlight-hold")
+    let openURL = source.root.appending(path: "open.threadlight")
     _ = try await service.export(hold: source.hold, custodians: [source.custodian], destination: openURL)
     #expect(try HoldTransferService.requiresPassphrase(url: openURL) == false)
 
@@ -578,6 +579,130 @@ import ZIPFoundation
     #expect(results[0].files.first?.size == nil)
     #expect(try await fixture.store.search(holdID: fixture.hold.id, query: .init(text: "injected")).isEmpty)
     #expect(try await fixture.store.search(holdID: fixture.hold.id, query: .init(text: "invalid timestamp")).isEmpty)
+}
+
+@Test func holdTransferListsEachMessageOnceAcrossSourceArchives() async throws {
+    let fixture = try StoreFixture()
+    defer { fixture.cleanup() }
+    try await fixture.seed()
+    // The same message arriving again from a second custodian's export, which is the ordinary
+    // shape of a hold-wide export set.
+    let second = SourceArchive(
+        holdID: fixture.hold.id,
+        custodianID: fixture.custodian.id,
+        originalFilename: "second.zip",
+        sha256: String(repeating: "b", count: 64),
+        coverageStart: nil,
+        coverageEnd: nil,
+        operatorBinding: "Legal Reviewer",
+        isPerCustodian: false
+    )
+    try await fixture.store.beginImport(second)
+    _ = try await fixture.store.insert(
+        message: fixture.message,
+        membership: .init(
+            holdID: fixture.hold.id,
+            custodianID: fixture.custodian.id,
+            messageID: fixture.message.id,
+            sourceArchiveID: second.id
+        )
+    )
+    try await fixture.store.completeImport(second)
+
+    let snapshot = try await fixture.store.transferSnapshot(
+        hold: fixture.hold,
+        custodians: [fixture.custodian],
+        fingerprint: HoldAccessKey.fingerprint(hold: fixture.hold, custodians: [fixture.custodian])
+    )
+    // Two provenance records, one copy of the message and its retained raw Slack JSON.
+    #expect(snapshot.memberships.count == 2)
+    #expect(snapshot.messages.count == 1)
+    #expect(snapshot.schemaVersion == HoldTransferSnapshot.schemaVersion)
+}
+
+@Test func holdTransferPackageIsCompressedAndStillRoundTrips() async throws {
+    let fixture = try StoreFixture()
+    defer { fixture.cleanup() }
+    try await fixture.seed()
+    let snapshot = try await fixture.store.transferSnapshot(
+        hold: fixture.hold,
+        custodians: [fixture.custodian],
+        fingerprint: HoldAccessKey.fingerprint(hold: fixture.hold, custodians: [fixture.custodian])
+    )
+    let cleartext = try CanonicalJSON.encode(snapshot)
+    let transferURL = fixture.root.appending(path: "compressed.threadlight")
+    _ = try await HoldTransferService(store: fixture.store).export(
+        hold: fixture.hold,
+        custodians: [fixture.custodian],
+        destination: transferURL
+    )
+    // Encrypted output cannot be compressed afterwards, so the saving has to happen here.
+    let written = try Data(contentsOf: transferURL)
+    #expect(written.count < cleartext.count)
+
+    let destination = try EvidenceStore(
+        url: fixture.root.appending(path: "reader.sqlite"),
+        key: Data(repeating: 9, count: 32)
+    )
+    let result = try await HoldTransferService(store: destination).importTransfer(
+        url: transferURL,
+        candidates: [.init(hold: fixture.hold, custodians: [fixture.custodian])]
+    )
+    #expect(result.hold.id == fixture.hold.id)
+    #expect(try await destination.search(holdID: fixture.hold.id, query: .init(text: "approval")).count == 1)
+}
+
+@Test func uncompressedSchemaOneHoldTransferStillImports() async throws {
+    let fixture = try StoreFixture()
+    defer { fixture.cleanup() }
+    try await fixture.seed()
+    let modern = try await fixture.store.transferSnapshot(
+        hold: fixture.hold,
+        custodians: [fixture.custodian],
+        fingerprint: HoldAccessKey.fingerprint(hold: fixture.hold, custodians: [fixture.custodian])
+    )
+    // Rebuild the shape ThreadLight wrote before messages were deduplicated and the payload
+    // was compressed, so packages already delivered to a recipient keep opening.
+    let messages = Dictionary(modern.messages.map { ($0.id, $0) }) { first, _ in first }
+    let legacy = LegacyHoldTransferSnapshot(
+        schemaVersion: 1,
+        createdAt: modern.createdAt,
+        holdID: modern.holdID,
+        organizationID: modern.organizationID,
+        holdFingerprint: modern.holdFingerprint,
+        archives: modern.archives,
+        records: modern.memberships.compactMap { membership in
+            messages[membership.messageID].map { HoldTransferRecord(message: $0, membership: membership) }
+        }
+    )
+    let cleartext = try CanonicalJSON.encode(legacy)
+    let salt = SymmetricKey(size: .bits256).withUnsafeBytes { Data($0) }
+    let key = HoldTransferService.key(
+        hold: fixture.hold,
+        custodians: [fixture.custodian],
+        salt: salt,
+        stretchedPassphrase: nil
+    )
+    var package = HoldTransferService.uncompressedMagic
+    package.append(0)
+    package.append(salt)
+    package.append(try AES.GCM.seal(cleartext, using: key).combined!)
+    // Written under the old file extension too, which import still accepts.
+    let legacyURL = fixture.root.appending(path: "legacy.threadlight-hold")
+    try package.write(to: legacyURL)
+    #expect(HoldTransferFile.isTransfer(legacyURL))
+    #expect(try HoldTransferService.requiresPassphrase(url: legacyURL) == false)
+
+    let destination = try EvidenceStore(
+        url: fixture.root.appending(path: "legacy-reader.sqlite"),
+        key: Data(repeating: 11, count: 32)
+    )
+    let result = try await HoldTransferService(store: destination).importTransfer(
+        url: legacyURL,
+        candidates: [.init(hold: fixture.hold, custodians: [fixture.custodian])]
+    )
+    #expect(result.hold.id == fixture.hold.id)
+    #expect(try await destination.search(holdID: fixture.hold.id, query: .init(text: "approval")).count == 1)
 }
 
 @Test func renamedCopyOfAnImportedExportIsReportedAsADuplicate() async throws {

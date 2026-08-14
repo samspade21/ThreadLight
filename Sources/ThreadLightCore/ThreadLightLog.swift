@@ -8,6 +8,11 @@ import os
 /// Log stage transitions, counts, durations, and error categories only. Counts are marked
 /// public so a support transcript is readable; every string stays private by default.
 ///
+/// Anything needed to diagnose a run after the fact must be logged at `notice` or higher.
+/// The unified log keeps `info` and `debug` in memory only and evicts them within minutes,
+/// so per-archive progress recorded at `info` is already gone by the time someone asks what
+/// happened. Reserve `info` for breadcrumbs that are worthless once the moment has passed.
+///
 /// Read a session back with:
 ///
 ///     log show --predicate 'subsystem == "dev.threadlight.app"' --last 1h --info

@@ -377,7 +377,7 @@ private struct PackageDropZone: View {
                 .foregroundStyle(ThreadLightTheme.threadGradient)
             Text(isImporting ? "Importing package…" : "Drag the legal hold package here")
                 .font(.title2.bold())
-            Text("Get the encrypted .threadlight-hold package from your Slack administrator, then drag it anywhere into this area.")
+            Text("Get the encrypted .threadlight package from your Slack administrator, then drag it anywhere into this area.")
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
                 .frame(maxWidth: 460)
@@ -404,7 +404,7 @@ private struct PackageDropZone: View {
         .contentShape(Rectangle())
         .dropDestination(for: URL.self) { urls, _ in
             guard !isImporting,
-                  let package = urls.first(where: { $0.pathExtension.lowercased() == "threadlight-hold" }) else { return false }
+                  let package = urls.first(where: { HoldTransferFile.isTransfer($0) }) else { return false }
             isImporting = true
             Task {
                 await model.importHoldTransfer(from: package)

@@ -42,7 +42,7 @@ If Slack returns `no_bot_scopes_requested`, the app manifest lost its `bot_user`
 2. Select an active legal hold and confirm its name and description.
 3. Add one or more untouched Slack JSON export ZIPs. Do not unzip, edit, or recompress them.
 4. Choose **Save encrypted package…**.
-5. Transfer the `.threadlight-hold` file through the approved channel.
+5. Transfer the `.threadlight` file through the approved channel.
 
 On a managed review Mac, ThreadLight loads the legal holds available to the signed-in person. Select a hold, choose **Import encrypted package**, then search the imported messages. If Slack later reports a different hold or member list, ThreadLight removes the old local data and requires a new package.
 
