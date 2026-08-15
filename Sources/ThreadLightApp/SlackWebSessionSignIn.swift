@@ -149,6 +149,23 @@ final class SlackWebSessionSignIn: NSObject {
         isPresented = false
     }
 
+    /// Manual recovery for a page that renders blank or black — an intermittent WebKit
+    /// compositor issue this app has not been able to rule out from inside its own process, even
+    /// after gating navigation on the sheet's window actually becoming key. Reloading from the
+    /// same live process is far lower-friction than quitting the whole app for a fresh one.
+    func reload() {
+        guard readyContinuation != nil else { return }
+        ThreadLightLog.session.notice("web session sign-in: manual reload requested")
+        if let request = pendingRequest {
+            // Navigation never actually started — still waiting on window attachment — so
+            // `WKWebView.reload()` would have nothing to reload; load directly instead.
+            pendingRequest = nil
+            webView.load(request)
+        } else {
+            webView.reload()
+        }
+    }
+
     /// Calls a Slack Web API method through the page's own authenticated session — the same
     /// mechanism `SlackLegalHoldClient`'s bearer-token transport uses, just carried by the
     /// browser's cookies and captured session token instead of an `Authorization` header.

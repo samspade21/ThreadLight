@@ -7,6 +7,11 @@ import WebKit
 private final class SlackWebViewHost: NSView {
     private let webView: WKWebView
     private let onAttachedToWindow: () -> Void
+    // Reassigning always removes the previous registration first, so there is never more than
+    // one live observer and a stale one can never fire after this view moves again.
+    private var windowVisibilityObserver: NSObjectProtocol? {
+        willSet { if let windowVisibilityObserver { NotificationCenter.default.removeObserver(windowVisibilityObserver) } }
+    }
 
     init(webView: WKWebView, onAttachedToWindow: @escaping () -> Void) {
         self.webView = webView
@@ -28,8 +33,30 @@ private final class SlackWebViewHost: NSView {
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
-        guard window != nil else { return }
-        onAttachedToWindow()
+        guard let window else {
+            windowVisibilityObserver = nil
+            return
+        }
+        // A sheet's child NSWindow can exist — and hold this view — before AppKit has finished
+        // animating it on screen as a real, WindowServer-backed drawable; `window != nil` alone
+        // still intermittently raced WebKit's compositor. Waiting for the window to actually
+        // become key (which a presented sheet always does) is the stronger signal.
+        if window.isVisible {
+            onAttachedToWindow()
+        } else {
+            windowVisibilityObserver = NotificationCenter.default.addObserver(
+                forName: NSWindow.didBecomeKeyNotification,
+                object: window,
+                queue: .main
+            ) { [weak self] _ in
+                // `queue: .main` guarantees this already runs on the main thread; this just
+                // proves that to the compiler instead of hopping through an actual Task.
+                MainActor.assumeIsolated {
+                    self?.windowVisibilityObserver = nil
+                    self?.onAttachedToWindow()
+                }
+            }
+        }
     }
 }
 
@@ -57,6 +84,11 @@ struct SlackWebSessionSheet: View {
                 Text(signIn.statusText)
                     .font(.headline)
                 Spacer()
+                Button("Reload", systemImage: "arrow.clockwise") {
+                    signIn.reload()
+                }
+                .keyboardShortcut("r", modifiers: .command)
+                .help("If the page below is blank or black, reload it.")
                 Button("Cancel", action: onCancel)
             }
             .padding(12)
