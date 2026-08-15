@@ -154,41 +154,84 @@ final class SlackWebSessionSignIn: NSObject {
     /// browser's cookies and captured session token instead of an `Authorization` header.
     /// Returns raw JSON `Data`, not a parsed dictionary — `[String: Any]` isn't `Sendable` and this
     /// crosses from this `@MainActor` type into the `SlackLegalHoldClient` actor.
+    ///
+    /// Retries a bare `TypeError: Load failed` — WebKit's generic message for a `fetch()` that
+    /// never reached Slack at all, as opposed to the tap script's own thrown errors, which name
+    /// something real (no session seen, a bad response). Seen once in the field, immediately
+    /// after a large import: a batch of unrelated calls all failed at the same instant, most
+    /// likely the backgrounded WKWebView's process getting squeezed by the import's own memory
+    /// use. One data point isn't enough to know how long that condition actually lasts, so this
+    /// backs off exponentially instead of guessing a single short delay — an export failing
+    /// outright and forcing a redo costs far more than a few extra seconds of retrying.
     func call(method: String, fields: [String: String]) async throws -> Data {
-        let value: Any?
-        do {
-            value = try await webView.callAsyncJavaScript(
-                "return JSON.stringify(await window.__threadLightCallSlackAPI(method, fields));",
-                arguments: ["method": method, "fields": fields],
-                in: nil,
-                contentWorld: .page
-            )
-        } catch {
-            ThreadLightLog.session.error("web session call failed: method=\(method, privacy: .public) category=\(ThreadLightLog.category(of: error), privacy: .public)")
-            let nsError = error as NSError
-            if nsError.domain == WKError.errorDomain, nsError.code == WKError.Code.javaScriptExceptionOccurred.rawValue {
-                // Raw WKError surfaces as "A JavaScript exception occurred", which reads like a
-                // crash and says nothing actionable. The JS message carries the real cause —
-                // most commonly the session tap timing out because the signed-in Slack page has
-                // gone stale — and the fix is always the same: sign in again.
-                let jsMessage = nsError.userInfo["WKJavaScriptExceptionMessage"] as? String
-                throw ThreadLightError.slack(
-                    "Slack's web session could not complete \(method). "
-                        + (jsMessage ?? "The Slack page reported a script error.")
-                        + " The saved Slack sign-in has likely gone stale — sign in to Slack again, then retry.",
-                    remediation: "Sign in to Slack again, then retry."
+        var attempt = 0
+        while true {
+            do {
+                return try await rawCall(method: method, fields: fields)
+            } catch {
+                attempt += 1
+                guard Self.isTransientNetworkFailure(error), attempt <= Self.maxTransientRetries else {
+                    throw Self.translate(error, method: method)
+                }
+                let delayMilliseconds = min(500 * (1 << (attempt - 1)), Self.maxTransientRetryDelayMilliseconds)
+                ThreadLightLog.session.notice(
+                    "web session call: transient network failure, retrying method=\(method, privacy: .public) attempt=\(attempt, privacy: .public) delayMs=\(delayMilliseconds, privacy: .public)"
                 )
+                try? await Task.sleep(for: .milliseconds(delayMilliseconds))
             }
-            throw error
         }
+    }
+
+    private static let maxTransientRetries = 4
+    private static let maxTransientRetryDelayMilliseconds = 4_000
+
+    private func rawCall(method: String, fields: [String: String]) async throws -> Data {
+        let value = try await webView.callAsyncJavaScript(
+            "return JSON.stringify(await window.__threadLightCallSlackAPI(method, fields));",
+            arguments: ["method": method, "fields": fields],
+            in: nil,
+            contentWorld: .page
+        )
         guard let jsonString = value as? String, let data = jsonString.data(using: .utf8) else {
-            ThreadLightLog.session.error("web session call: unreadable response method=\(method, privacy: .public)")
             throw ThreadLightError.slack(
                 "Slack's web session returned an unreadable response.",
                 remediation: "Try signing in again."
             )
         }
         return data
+    }
+
+    private static func isTransientNetworkFailure(_ error: Error) -> Bool {
+        let nsError = error as NSError
+        guard nsError.domain == WKError.errorDomain,
+              nsError.code == WKError.Code.javaScriptExceptionOccurred.rawValue,
+              let message = nsError.userInfo["WKJavaScriptExceptionMessage"] as? String else { return false }
+        return message.contains("Load failed") || message.contains("NetworkError")
+    }
+
+    private static func translate(_ error: Error, method: String) -> Error {
+        ThreadLightLog.session.error("web session call failed: method=\(method, privacy: .public) category=\(ThreadLightLog.category(of: error), privacy: .public)")
+        let nsError = error as NSError
+        guard nsError.domain == WKError.errorDomain, nsError.code == WKError.Code.javaScriptExceptionOccurred.rawValue else {
+            return error
+        }
+        if isTransientNetworkFailure(error) {
+            return ThreadLightError.slack(
+                "Slack's web session lost its network connection while completing \(method), and retrying didn't recover it.",
+                remediation: "Check your network connection and try again. This is not a sign-in problem."
+            )
+        }
+        // Raw WKError surfaces as "A JavaScript exception occurred", which reads like a crash
+        // and says nothing actionable. The JS message carries the real cause — most commonly
+        // the session tap timing out because the signed-in Slack page has gone stale — and the
+        // fix is always the same: sign in again.
+        let jsMessage = nsError.userInfo["WKJavaScriptExceptionMessage"] as? String
+        return ThreadLightError.slack(
+            "Slack's web session could not complete \(method). "
+                + (jsMessage ?? "The Slack page reported a script error.")
+                + " The saved Slack sign-in has likely gone stale — sign in to Slack again, then retry.",
+            remediation: "Sign in to Slack again, then retry."
+        )
     }
 
     /// Generic session tap, adapted from `SlackExportScript`'s DevTools helper: watches the
