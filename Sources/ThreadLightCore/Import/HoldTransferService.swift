@@ -169,6 +169,12 @@ public struct HoldTransferService: Sendable {
                       ) else {
                     continue
                 }
+                // A refreshed package for a hold that already has locally-imported evidence is
+                // meant to replace it, not merge with it — `importTransferSnapshot` only ever
+                // adds archives it hasn't seen by hash, so without this, evidence dropped from a
+                // newer package (e.g. behind a revised export scope or an upstream redaction)
+                // would linger forever alongside the new snapshot's contents.
+                try await store.purgeEvidence(holdID: candidate.hold.id)
                 let counts = try await store.importTransferSnapshot(
                     snapshot,
                     hold: candidate.hold,

@@ -663,6 +663,15 @@ final class AppModel {
         var warningCount = 0
         ThreadLightLog.importer.notice("import started: archives=\(urls.count, privacy: .public)")
         do {
+            // A fresh import for this hold should replace whatever is already there, not merge
+            // with it — otherwise evidence dropped from a refreshed export (a revised scope, an
+            // upstream redaction) would linger forever alongside the new archives. But a hold
+            // left with an incomplete archive is mid-resume of a previously cancelled import,
+            // not a fresh one, and purging here would throw away the completed archives that
+            // resume is meant to leave alone.
+            if try await !store.hasIncompleteImport(holdID: hold.id) {
+                try await store.purgeEvidence(holdID: hold.id)
+            }
             let importer = SlackExportImporter(store: store) { [weak self] progress in
                 await MainActor.run { self?.importProgress = progress }
             }
@@ -1291,6 +1300,14 @@ final class AppModel {
             threadLoadTask?.cancel()
             let active = activeStorageNamespace
             let namespaces = knownStorageNamespaces().union(active.map { [$0] } ?? [])
+            // Clear the in-memory/UI state before the slow on-disk purge below, not after —
+            // deleting potentially large amounts of evidence from SQLite/the resource vault can
+            // take a while, and every open window shares this same model, so leaving the old
+            // rows in place until the disk work finished made purge look like it hadn't done
+            // anything yet.
+            holds.removeAll(); custodians.removeAll(); conversations.removeAll(); importedCustodianIDs.removeAll(); hasImportedPackage = false; messages.removeAll(); selectedHold = nil
+            selectedMessage = nil; selectedMessageIDs.removeAll(); threadMessages.removeAll()
+            sidebarSelection = .setup
             for namespace in namespaces.sorted() {
                 if namespace == active {
                     try await store?.purge()
@@ -1301,9 +1318,6 @@ final class AppModel {
                 }
                 UserDefaults.standard.removeObject(forKey: Self.lastActivityKeyPrefix + namespace)
             }
-            holds.removeAll(); custodians.removeAll(); conversations.removeAll(); importedCustodianIDs.removeAll(); hasImportedPackage = false; messages.removeAll(); selectedHold = nil
-            selectedMessage = nil; selectedMessageIDs.removeAll(); threadMessages.removeAll()
-            sidebarSelection = .setup
             setup.update(.custodianExports, state: .pending)
             setup.update(.attachments, state: .pending)
             touchActivity()

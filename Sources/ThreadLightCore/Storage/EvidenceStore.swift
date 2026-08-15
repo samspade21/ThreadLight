@@ -250,6 +250,18 @@ public actor EvidenceStore {
         }
     }
 
+    /// True if this hold has a source archive left mid-import — always the result of a
+    /// cancelled import kept around to resume (a genuine failure runs `abandonImport`, which
+    /// deletes the row instead of leaving it incomplete). Callers use this to tell a resume of
+    /// an interrupted batch apart from a deliberately fresh one.
+    public func hasIncompleteImport(holdID: String) throws -> Bool {
+        let count: Int64 = try firstRow(
+            "SELECT count(*) FROM source_archives WHERE hold_id = ? AND complete = 0",
+            [.text(holdID)]
+        ) { sqlite3_column_int64($0, 0) } ?? 0
+        return count > 0
+    }
+
     func resumableImport(sha256: String, holdID: String) throws -> (SourceArchive, StoredImportCheckpoint)? {
         try firstRow(
             """

@@ -49,7 +49,12 @@ final class SlackWebSessionSignIn: NSObject {
         let configuration = WKWebViewConfiguration()
         configuration.websiteDataStore = .default()
         configuration.userContentController = contentController
-        webView = WKWebView(frame: .zero, configuration: configuration)
+        // A zero starting frame leaves WKWebView's compositor negotiating its surface size at
+        // the same time SwiftUI is still creating the sheet's own window — that race is what
+        // painted a black or blank-white frame until the person retried enough times to win it.
+        // Starting at the sheet's real size (SlackWebSessionSheet's minWidth/minHeight) avoids
+        // the race instead of just narrowing it.
+        webView = WKWebView(frame: CGRect(x: 0, y: 0, width: 720, height: 640), configuration: configuration)
         super.init()
         webView.navigationDelegate = self
 #if THREADLIGHT_DEVELOPMENT
@@ -111,7 +116,14 @@ final class SlackWebSessionSignIn: NSObject {
             urlObservation = Publishers.Merge(urlChanges, loadingChanges).sink { [weak self] in
                 self?.checkArrival()
             }
-            webView.load(URLRequest(url: url))
+            // Starting the load here races SwiftUI's own sheet/window creation triggered by
+            // `isPresented = true` above — WebKit can begin compositing before the web view is
+            // actually installed in a real window, which is what painted black/white instead of
+            // the page. Deferring one run-loop turn lets that window creation finish first.
+            let webView = webView
+            DispatchQueue.main.async {
+                webView.load(URLRequest(url: url))
+            }
         }
         urlObservation = nil
         statusText = "Signed in."
