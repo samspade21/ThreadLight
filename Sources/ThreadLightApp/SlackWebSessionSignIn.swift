@@ -25,6 +25,7 @@ final class SlackWebSessionSignIn: NSObject {
     private var targetPath = ""
     private var readyContinuation: CheckedContinuation<Void, Error>?
     private var urlObservation: AnyCancellable?
+    private var pendingRequest: URLRequest?
 
     override init() {
         let contentController = WKUserContentController()
@@ -49,11 +50,8 @@ final class SlackWebSessionSignIn: NSObject {
         let configuration = WKWebViewConfiguration()
         configuration.websiteDataStore = .default()
         configuration.userContentController = contentController
-        // A zero starting frame leaves WKWebView's compositor negotiating its surface size at
-        // the same time SwiftUI is still creating the sheet's own window — that race is what
-        // painted a black or blank-white frame until the person retried enough times to win it.
-        // Starting at the sheet's real size (SlackWebSessionSheet's minWidth/minHeight) avoids
-        // the race instead of just narrowing it.
+        // Match the sheet's initial size so its first remote layer tree has real dimensions.
+        // Navigation itself is gated on AppKit attachment in webViewDidAttachToWindow().
         webView = WKWebView(frame: CGRect(x: 0, y: 0, width: 720, height: 640), configuration: configuration)
         super.init()
         webView.navigationDelegate = self
@@ -89,6 +87,7 @@ final class SlackWebSessionSignIn: NSObject {
         readyContinuation?.resume(throwing: CancellationError())
         readyContinuation = nil
         urlObservation = nil
+        pendingRequest = nil
         webView.navigationDelegate = self
 
         targetPath = "/manage/\(enterpriseID)/security/legal-holds"
@@ -96,15 +95,13 @@ final class SlackWebSessionSignIn: NSObject {
             throw ThreadLightError.invalidConfiguration("Could not build the Slack legal holds admin console URL.")
         }
         statusText = "Sign in to Slack to continue."
-        isPresented = true
 
         try await withCheckedThrowingContinuation { continuation in
-            // readyContinuation must be set before subscribing/loading — WKWebView's .url
-            // updates near-instantly when load() starts, before any real navigation or login
-            // redirect happens, so the very first KVO firing can arrive before this line if
-            // the load happens first. That race meant every URL match got missed, silently
-            // discarded by a `readyContinuation != nil` guard that had nothing to resume.
+            // Install all state before presentation. SwiftUI may build and attach the sheet as
+            // soon as isPresented changes; the attachment callback must always find a request
+            // and a continuation ready to receive its navigation events.
             readyContinuation = continuation
+            pendingRequest = URLRequest(url: url)
             // Slack's site is a single-page app — the final navigation onto the target page
             // after SSO completes can happen via client-side JS routing, which never fires
             // WKNavigationDelegate.didFinish again. Watching the URL directly catches that too.
@@ -116,18 +113,21 @@ final class SlackWebSessionSignIn: NSObject {
             urlObservation = Publishers.Merge(urlChanges, loadingChanges).sink { [weak self] in
                 self?.checkArrival()
             }
-            // Starting the load here races SwiftUI's own sheet/window creation triggered by
-            // `isPresented = true` above — WebKit can begin compositing before the web view is
-            // actually installed in a real window, which is what painted black/white instead of
-            // the page. Deferring one run-loop turn lets that window creation finish first.
-            let webView = webView
-            DispatchQueue.main.async {
-                webView.load(URLRequest(url: url))
-            }
+            isPresented = true
         }
         urlObservation = nil
         statusText = "Signed in."
         isPresented = false
+    }
+
+    /// Called only after AppKit has attached the browser host to the sheet's window. This is the
+    /// lifecycle boundary a queued main-thread block cannot provide: sheet creation may span
+    /// several run-loop turns on a cold WebKit launch.
+    func webViewDidAttachToWindow() {
+        guard readyContinuation != nil, let request = pendingRequest else { return }
+        pendingRequest = nil
+        ThreadLightLog.session.notice("web session sign-in: web view attached; starting navigation")
+        webView.load(request)
     }
 
     private func checkArrival() {
@@ -143,6 +143,7 @@ final class SlackWebSessionSignIn: NSObject {
         webView.stopLoading()
         webView.navigationDelegate = nil
         urlObservation = nil
+        pendingRequest = nil
         readyContinuation?.resume(throwing: CancellationError())
         readyContinuation = nil
         isPresented = false
@@ -287,5 +288,30 @@ final class SlackWebSessionSignIn: NSObject {
 extension SlackWebSessionSignIn: WKNavigationDelegate {
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         checkArrival()
+    }
+
+    func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+        failNavigation(error)
+    }
+
+    func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+        failNavigation(error)
+    }
+
+    private func failNavigation(_ error: Error) {
+        let nsError = error as NSError
+        guard !(nsError.domain == NSURLErrorDomain && nsError.code == NSURLErrorCancelled),
+              readyContinuation != nil else { return }
+        ThreadLightLog.session.error(
+            "web session sign-in: navigation failed domain=\(nsError.domain, privacy: .public) code=\(nsError.code, privacy: .public)"
+        )
+        readyContinuation?.resume(throwing: ThreadLightError.slack(
+            "Slack's sign-in page could not be opened.",
+            remediation: "Check your network connection, then try signing in again."
+        ))
+        readyContinuation = nil
+        pendingRequest = nil
+        urlObservation = nil
+        isPresented = false
     }
 }
