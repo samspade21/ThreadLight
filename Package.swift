@@ -10,7 +10,7 @@ let package = Package(
         .executable(name: "threadlight-verify", targets: ["ThreadLightVerify"]),
     ],
     dependencies: [
-        .package(url: "https://github.com/sqlcipher/SQLCipher.swift.git", exact: "4.17.0"),
+        .package(url: "https://github.com/sqlcipher/SQLCipher.swift.git", exact: "4.18.0"),
         .package(url: "https://github.com/weichsel/ZIPFoundation.git", exact: "0.9.20"),
     ],
     targets: [
