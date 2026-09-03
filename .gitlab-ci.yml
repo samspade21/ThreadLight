@@ -1,0 +1,16 @@
+include:
+  - project: 'dataminr-internal/gitlab-ci-confluence-documentation'
+    file: gitlab-ci/confluence-docs.yml
+    ref: main
+
+variables:
+  CONFLUENCE_DOCS_PATH: docs
+
+# This is currently the repo's only CI job. It normally runs in `.post`, but GitLab
+# skips a pipeline whose jobs are all in `.pre`/`.post`, so pin it to a real stage.
+confluence-docs:
+  stage: test
+
+# Preview the planned Confluence page tree on merge requests, without publishing.
+confluence-docs-preview:
+  extends: .confluence-docs-preview
