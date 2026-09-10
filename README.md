@@ -2,7 +2,7 @@
 
 **An open-source Slack legal hold and eDiscovery tool for macOS.** Apache License 2.0.
 
-ThreadLight is a read-only Mac app for reviewing Slack Enterprise legal-hold exports. It lets a legal team collect, preserve, search, review, and produce Slack evidence without uploading it to ThreadLight, an AI service, an analytics service, or a hosted review system. The evidence never leaves the Macs handling the case, and the whole source is auditable — which matters when a review tool's behavior may itself have to be explained.
+ThreadLight is a read-only Mac app for reviewing Slack Enterprise legal-hold exports. It lets a legal team collect, preserve, search, review, and produce Slack evidence to meet litigation hold, eDiscovery, and data preservation obligations — without uploading it to ThreadLight, an AI service, an analytics service, or a hosted review system. The evidence never leaves the Macs handling the case, and the whole source is auditable — which matters when a review tool's behavior may itself have to be explained.
 
 ThreadLight does not create legal holds or change Slack. Slack remains the system of record for the hold; ThreadLight is the local review tool.
 
